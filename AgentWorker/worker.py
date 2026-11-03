@@ -2,15 +2,28 @@ import os
 import time
 import glob
 import argparse
+import re
 import requests
 import docker
 import ollama
+from bs4 import BeautifulSoup
 
 # ================= CONFIGURATION =================
-WORKSPACE_DIR = os.path.expanduser("~/ai-agent-workspace")
-QUEUE_DIR = os.path.join(WORKSPACE_DIR, "queue")
-COMPLETED_DIR = os.path.join(WORKSPACE_DIR, "completed")
-LOGS_DIR = os.path.join(WORKSPACE_DIR, "logs")
+# Script directory (where Dockerfile and script live)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 1. Global Queue, completed tasks, and logs live in ~/ai-agent-workspace
+GLOBAL_WORKSPACE_DIR = os.path.expanduser("~/ai-agent-workspace")
+QUEUE_DIR = os.path.join(GLOBAL_WORKSPACE_DIR, "queue")
+COMPLETED_DIR = os.path.join(GLOBAL_WORKSPACE_DIR, "completed")
+LOGS_DIR = os.path.join(GLOBAL_WORKSPACE_DIR, "logs")
+
+# 2. Local workspace folder right next to script binds to /workspace in container
+LOCAL_PROJECT_WORKSPACE = os.path.join(SCRIPT_DIR, "workspace")
+
+# Docker Configuration
+IMAGE_NAME = "platformio-agent-sandbox:latest"
+SANDBOX_CONTAINER_NAME = "ai-sandbox"
 
 # Model configurations
 HEAVY_MODEL = "qwen3.6-27b-uncensored"
@@ -19,19 +32,63 @@ FAST_MODEL = "qwen2.5-coder:7b"
 HEAVY_HOST = "http://localhost:11434"
 FAST_HOST = "http://localhost:11435"
 
-SANDBOX_CONTAINER_NAME = "ollama-nvidia"
-MAX_ITERATIONS = 10  # Generous cap for complex multi-step tasks
-
 # Initialize Docker client
 docker_client = docker.from_env()
 
-# Ensure directories exist
+# Ensure global directories exist (queue, completed, logs)
 os.makedirs(QUEUE_DIR, exist_ok=True)
 os.makedirs(COMPLETED_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
+# Ensure local project workspace directory exists
+os.makedirs(LOCAL_PROJECT_WORKSPACE, exist_ok=True)
+
 heavy_client = ollama.Client(host=HEAVY_HOST)
 fast_client = ollama.Client(host=FAST_HOST)
+
+
+def ensure_sandbox_running():
+    """Ensures the sandbox container is built, running, and has the local workspace mounted."""
+    print("[*] Checking sandbox container status...")
+    
+    try:
+        container = docker_client.containers.get(SANDBOX_CONTAINER_NAME)
+        if container.status != "running":
+            print(f"[*] Container '{SANDBOX_CONTAINER_NAME}' is stopped. Starting it...")
+            container.start()
+        else:
+            print(f"[✓] Container '{SANDBOX_CONTAINER_NAME}' is already running.")
+        return
+    except docker.errors.NotFound:
+        print(f"[*] Container '{SANDBOX_CONTAINER_NAME}' not found. Creating a new one...")
+
+    # Check/Build image if missing
+    try:
+        docker_client.images.get(IMAGE_NAME)
+        print(f"[✓] Docker image '{IMAGE_NAME}' found locally.")
+    except docker.errors.ImageNotFound:
+        print(f"[*] Docker image '{IMAGE_NAME}' not found. Building from Dockerfile...")
+        docker_client.images.build(
+            path=SCRIPT_DIR,  # Looks for Dockerfile in script folder
+            tag=IMAGE_NAME, 
+            rm=True
+        )
+        print(f"[✓] Image '{IMAGE_NAME}' built successfully.")
+
+    # Launch container with local project workspace mounted to /workspace
+    print(f"[*] Launching container '{SANDBOX_CONTAINER_NAME}'...")
+    docker_client.containers.run(
+        image=IMAGE_NAME,
+        name=SANDBOX_CONTAINER_NAME,
+        command="tail -f /dev/null",  # Keeps container alive in background
+        detach=True,
+        volumes={
+            # Bind the local workspace folder next to the script to /workspace inside the container
+            os.path.abspath(LOCAL_PROJECT_WORKSPACE): {"bind": "/workspace", "mode": "rw"}
+        },
+        security_opt=["label:disable"]  # Bypasses SELinux volume permission blocks if present
+    )
+    print(f"[✓] Sandbox container '{SANDBOX_CONTAINER_NAME}' is up and ready.")
 
 
 def search_web(query: str) -> str:
@@ -45,7 +102,6 @@ def search_web(query: str) -> str:
         if response.status_code != 200:
             return f"Search failed with status code {response.status_code}"
             
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(response.text, 'html.parser')
         results = []
         for a in soup.find_all('a', class_='result__snippet', limit=3):
@@ -59,15 +115,19 @@ def search_web(query: str) -> str:
 
 
 def run_in_sandbox(command: str) -> str:
-    """Executes a bash command safely inside the isolated Docker container."""
+    """Executes a bash command safely inside the isolated Docker container with path auto-correction."""
     try:
+        # Interceptor: catch model path typos like /workflow, /worksp, etc. 
+        # and force-rewrite them to /workspace so files always land in the right spot.
+        command = re.sub(r'/(workflow|worksp[a-zA-Z-]*)', '/workspace', command, flags=re.IGNORECASE)
+        
         container = docker_client.containers.get(SANDBOX_CONTAINER_NAME)
         print(f"\n[Sandbox] Running command in container:\n{command}")
         
         # Explicitly ensure /workspace exists inside the container first
         container.exec_run(cmd=["mkdir", "-p", "/workspace"])
         
-        # Run command with workdir set safely
+        # Run command with workdir set strictly to /workspace
         result = container.exec_run(
             cmd=["bash", "-c", command],
             workdir="/workspace"
@@ -87,8 +147,8 @@ def run_in_sandbox(command: str) -> str:
 
 
 def audit_code_safety(code_block: str) -> bool:
-    """Sends generated code to the fast auditor model on the 1080 container."""
-    print(f"[Auditor] Sending code/commands to {FAST_MODEL} on 1080 container...")
+    """Sends generated code to the fast auditor model."""
+    print(f"[Auditor] Sending code/commands to {FAST_MODEL}...")
     audit_prompt = (
         "You are a strict security auditor. Analyze the following shell commands/code. "
         "Check if they contain malicious intent, destructive filesystem wipes (like rm -rf /), "
@@ -98,7 +158,7 @@ def audit_code_safety(code_block: str) -> bool:
     try:
         response = fast_client.chat(
             model=FAST_MODEL,
-            messages=[{"role": "user", "content": audit_prompt}],  # Fixed from "prompt" to "content"
+            messages=[{"role": "user", "content": audit_prompt}],
             options={"temperature": 0.0}
         )
         verdict = response['message']['content'].strip().upper()
@@ -113,11 +173,10 @@ def audit_code_safety(code_block: str) -> bool:
 
 
 def extract_tag_content(text: str, tag: str) -> str:
-    """Helper to parse custom XML-like tags from heavy model output."""
-    start_tag = f"<{tag}>"
-    end_tag = f"</{tag}>"
-    if start_tag in text and end_tag in text:
-        return text.split(start_tag)[1].split(end_tag)[0].strip()
+    """Helper to parse custom XML-like tags using regex."""
+    match = re.search(f"<{tag}>(.*?)</{tag}>", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
     return ""
 
 
@@ -146,11 +205,15 @@ def process_queue(enable_internet: bool):
                 {
                     "role": "user",
                     "content": (
-                        "You are an autonomous background agent operating inside a secure Docker container (/workspace). "
-                        "You can execute multi-step tasks. For each step, analyze what needs to be done. "
+                        "You are an autonomous background agent operating inside a secure Docker container. "
+                        "**CRITICAL DIRECTORY RULE:** Your current working directory is **`/workspace`**. "
+                        "All files, directories, code scripts, and PlatformIO projects MUST be created and executed right here in `/workspace` (or relative to it). "
+                        "For complex code projects, build files incrementally across multiple steps rather than all at once to avoid token cutoff. "
+                        "Because `/workspace` is mounted to the local workspace folder next to the worker script, everything you build here will automatically save to your host machine.\n\n"
+                        "For each step, analyze what needs to be done. "
                         "If you need to run bash commands, enclose them in <commands>...</commands>. "
                         "If you need to search the web for documentation or answers (if enabled), enclose the query in <search>...</search>. "
-                        "When you have completely finished the task and verified success, write <status>COMPLETE</status>. "
+                        "When you have completely finished the task and verified success with working tests, write <status>COMPLETE</status>. "
                         "If you need to continue to the next step or retry after an error, write <status>CONTINUE</status>.\n\n"
                         f"Task Goal: {initial_prompt}"
                     )
@@ -160,11 +223,11 @@ def process_queue(enable_internet: bool):
             last_execution_output = "No commands executed yet."
             final_summary = ""
             
-            while iteration < MAX_ITERATIONS and not task_success:
+            # Open-ended loop governed by model status tags
+            while not task_success:
                 iteration += 1
-                print(f"\n--- Iteration {iteration} of {MAX_ITERATIONS} ---")
+                print(f"\n--- Autonomous Step {iteration} ---")
                 
-                # Feed the latest state/output back into conversation history
                 feedback_msg = (
                     f"Result of previous step / execution output:\n{last_execution_output}\n\n"
                     "Determine the next action. Output <commands>...</commands> if you need to run code, "
@@ -172,25 +235,23 @@ def process_queue(enable_internet: bool):
                 )
                 conversation_history.append({"role": "user", "content": feedback_msg})
                 
-                # Call heavy model
                 response = heavy_client.chat(model=HEAVY_MODEL, messages=conversation_history)
                 model_reply = response['message']['content']
                 conversation_history.append({"role": "assistant", "content": model_reply})
                 
                 print(f"\n[Heavy Model Reasoning & Plan]:\n{model_reply}")
                 
-                # Check status decided by the model
                 status = extract_tag_content(model_reply, "status").upper()
                 
-                # 1. Check if model requested a web search (and feature is enabled)
+                # 1. Check web search request
                 search_query = extract_tag_content(model_reply, "search")
                 if search_query and enable_internet:
                     search_results = search_web(search_query)
                     last_execution_output = search_results
                     print(f"[Search Result Output Provided to Model]")
-                    continue # Let model evaluate search results in next loop
+                    continue
                 
-                # 2. Extract and audit bash commands if requested
+                # 2. Extract and audit bash commands
                 commands = extract_tag_content(model_reply, "commands")
                 if commands:
                     if not audit_code_safety(commands):
@@ -198,26 +259,22 @@ def process_queue(enable_internet: bool):
                         last_execution_output = "Blocked by security auditor due to policy violation."
                         break
                     
-                    # Run in container sandbox
                     last_execution_output = run_in_sandbox(commands)
                 else:
                     last_execution_output = "No commands were provided in this step."
                 
-                # 3. Evaluate completion
-                if status == "COMPLETE" or ("Exit Code: 0" in last_execution_output and not commands):
+                # 3. Strict Completion Evaluation
+                if status == "COMPLETE":
                     print(f"[✓] Task {task_name} marked COMPLETE by model.")
                     task_success = True
                     final_summary = model_reply
                     break
-                elif status == "CONTINUE":
+                elif status == "CONTINUE" or commands:
                     print("[*] Model decided to continue to next step...")
                 else:
-                    # Fallback default if status tag was missing
-                    if "Exit Code: 0" in last_execution_output:
-                        task_success = True
-                        break
+                    print("[*] No explicit status tag found. Continuing loop...")
 
-            # Generate clean summary log
+            # Save log file
             log_filename = os.path.join(LOGS_DIR, f"log_{task_name}")
             with open(log_filename, "w") as log_file:
                 log_file.write(
@@ -233,6 +290,7 @@ def process_queue(enable_internet: bool):
             os.rename(task_path, completed_path)
             print(f"[✓] Task {task_name} archived.")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Autonomous Agent Background Worker")
     parser.add_argument(
@@ -243,6 +301,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     try:
+        ensure_sandbox_running()
         process_queue(enable_internet=args.enable_internet)
     except KeyboardInterrupt:
         print("\n[!] Worker stopped gracefully by user.")
