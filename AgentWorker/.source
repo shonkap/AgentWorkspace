@@ -1,0 +1,5 @@
+#!/bin/bash
+# Activate the virtual environment and drop into an interactive shell with pip ready
+source ./venv/bin/activate
+echo "✨ Virtual environment activated! 'pip' is ready to use."
+exec "$SHELL"
