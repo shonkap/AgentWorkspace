@@ -12,10 +12,11 @@ from bs4 import BeautifulSoup
 # Script directory (where Dockerfile and script live)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 1. Global Queue, completed tasks, and logs live in ~/ai-agent-workspace
+# 1. Global Queue, completed tasks, failed tasks, and logs live in ~/ai-agent-workspace
 GLOBAL_WORKSPACE_DIR = os.path.expanduser("~/ai-agent-workspace")
 QUEUE_DIR = os.path.join(GLOBAL_WORKSPACE_DIR, "queue")
 COMPLETED_DIR = os.path.join(GLOBAL_WORKSPACE_DIR, "completed")
+FAILED_DIR = os.path.join(GLOBAL_WORKSPACE_DIR, "failed")
 LOGS_DIR = os.path.join(GLOBAL_WORKSPACE_DIR, "logs")
 
 # 2. Local workspace folder right next to script binds to /workspace in container
@@ -35,9 +36,10 @@ FAST_HOST = "http://localhost:11435"
 # Initialize Docker client
 docker_client = docker.from_env()
 
-# Ensure global directories exist (queue, completed, logs)
+# Ensure global directories exist
 os.makedirs(QUEUE_DIR, exist_ok=True)
 os.makedirs(COMPLETED_DIR, exist_ok=True)
+os.makedirs(FAILED_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 # Ensure local project workspace directory exists
@@ -83,7 +85,6 @@ def ensure_sandbox_running():
         command="tail -f /dev/null",  # Keeps container alive in background
         detach=True,
         volumes={
-            # Bind the local workspace folder next to the script to /workspace inside the container
             os.path.abspath(LOCAL_PROJECT_WORKSPACE): {"bind": "/workspace", "mode": "rw"}
         },
         security_opt=["label:disable"]  # Bypasses SELinux volume permission blocks if present
@@ -115,20 +116,20 @@ def search_web(query: str) -> str:
 
 
 def validate_commands_with_fast_model(commands: str):
-    """Strict validator that instantly blocks any path containing a space after a slash (like / workspace)."""
+    """Strict validator that instantly blocks any path containing a space after a slash."""
     print(f"[*] Fast model ({FAST_MODEL}) validating command paths and spacing...")
     
     prompt = (
         "You are a strict syntax and path validator for an autonomous agent. "
         "Review the following bash commands for path errors:\n\n"
         "CRITICAL RULE:\n"
-        "1. BLOCK (INVALID) IMMEDIATELY if any path contains a space right after a slash, such as / workspace, '/ workspace/', or \"/ workspace/game.py\". "
-        "Linux paths cannot have spaces after slashes. They must always be written tightly as /workspace.\n"
+        "1. BLOCK (INVALID) IMMEDIATELY if any path contains a space right after a slash, such as / workspace. "
+        "They must always be written tightly as /workspace.\n"
         "2. BLOCK (INVALID) if the agent tries to dump project files into root-level directories instead of /workspace.\n"
         "3. ALLOW clean paths that correctly use /workspace or relative paths with zero spaces after slashes.\n\n"
         "Format your reply strictly as:\n"
         "STATUS: VALID or INVALID\n"
-        "REASON: (If invalid, state clearly: 'Forbidden space detected after slash. Change / workspace to /workspace.')\n\n"
+        "REASON: (If invalid, state clearly why)\n\n"
         f"Commands to review:\n{commands}"
     )
     
@@ -151,6 +152,7 @@ def validate_commands_with_fast_model(commands: str):
     except Exception as e:
         print(f"[Warning] Fast model validation failed, defaulting to allow: {e}")
         return True, "OK"
+
 
 def audit_code_safety(code_block: str) -> tuple[bool, str]:
     """Sends generated code to the fast auditor model, returning (is_safe, reason)."""
@@ -184,15 +186,13 @@ def audit_code_safety(code_block: str) -> tuple[bool, str]:
 
 
 def run_in_sandbox(command: str) -> str:
-    """Executes bash commands directly inside the container, with strict output truncation to protect context."""
+    """Executes bash commands directly inside the container, with strict output truncation."""
     try:
         container = docker_client.containers.get(SANDBOX_CONTAINER_NAME)
         print(f"\n[Sandbox Exec]:\n{command}")
         
-        # Ensure /workspace exists inside the container
         container.exec_run(cmd=["mkdir", "-p", "/workspace"])
         
-        # Execute strictly inside /workspace so relative paths work automatically
         result = container.exec_run(
             cmd=["bash", "-c", command],
             workdir="/workspace"
@@ -201,13 +201,12 @@ def run_in_sandbox(command: str) -> str:
         output = result.output.decode("utf-8")
         exit_code = result.exit_code
         
-        # CRITICAL SAFETY NET: Truncate massive outputs to prevent context window token explosions
         MAX_OUTPUT_CHARS = 4000
         if len(output) > MAX_OUTPUT_CHARS:
             output = (
                 output[:MAX_OUTPUT_CHARS] + 
                 f"\n\n[⚠️ WARNING: Output truncated! {len(output)} total characters generated. "
-                "Avoid recursive listings like 'ls -laR' or dumping large files directly into stdout.]"
+                "Avoid recursive listings or dumping massive files directly into stdout.]"
             )
         
         combined_output = f"Exit Code: {exit_code}\nOutput:\n{output}"
@@ -248,20 +247,25 @@ def process_queue(enable_internet: bool):
             print(f"Prompt: {initial_prompt}")
             
             iteration = 0
+            absolute_max_ceiling = 60  # Absolute hard ceiling for any task
+            dynamic_task_limit = 15    # Initial default budget before model reports estimate
+            buffer_steps = 5           # Extra wiggle room added to model's estimate
+            
+            consecutive_no_command_turns = 0
             task_success = False
+            previous_estimate = "N/A"  # Track estimate across turns
+            
             conversation_history = [
                 {
                     "role": "user",
                     "content": (
                         "You are an autonomous background agent operating inside a secure Docker container. "
                         "**CRITICAL DIRECTORY RULE:** Your current working directory is **`/workspace`**. "
-                        "All files, directories, code scripts, and projects MUST be created and executed right here in `/workspace` (or relative to it). "
+                        "All files, directories, code scripts, and projects MUST be created and executed right here in `/workspace`. "
                         "\n\n🚨 **CRITICAL CODING RULE (NO MONOLITHIC FILES):** "
-                        "Never try to write a massive 300+ line script in a single command block, or your output will get cut off by token limits! "
-                        "Build projects incrementally: Create the base file first (e.g., using `touch` or a small skeleton), "
-                        "and then use python scripts or `cat << 'EOF' >> filename` to append classes, rooms, or logic step-by-step across multiple iterations. "
-                        "\n\nFor each step, analyze what needs to be done. "
-                        "Enclose bash commands in <commands>...</commands>, web search queries in <search>...</search>, "
+                        "Never try to write a massive 300+ line script in a single command block! Build incrementally across steps. "
+                        "\n\nFor each step, enclose bash commands in <commands>...</commands>, web search queries in <search>...</search>, "
+                        "your estimated remaining steps in <estimated_steps>X</estimated_steps> (where X is a number that decreases as you make progress), "
                         "and write <status>COMPLETE</status> when finished or <status>CONTINUE</status> to proceed."
                         f"\n\nTask Goal: {initial_prompt}"
                     )
@@ -271,17 +275,29 @@ def process_queue(enable_internet: bool):
             last_execution_output = "No commands executed yet."
             final_summary = ""
             
-            # Open-ended loop governed by model status tags, with prompt reinforcement on every turn
             while not task_success:
                 iteration += 1
-                print(f"\n--- Autonomous Step {iteration} ---")
+                print(f"\n--- Autonomous Step {iteration} (Dynamic Limit: {dynamic_task_limit} | Absolute Ceiling: {absolute_max_ceiling}) ---")
+                
+                # Hybrid budget enforcement: check against dynamic estimate limit
+                if iteration > dynamic_task_limit:
+                    print(f"[!] Task {task_name} exceeded dynamic estimate limit (Hit step {iteration}, budget was {dynamic_task_limit}). Moving to failed folder.")
+                    
+                    log_filename = os.path.join(LOGS_DIR, f"failed_{task_name}.log")
+                    with open(log_filename, "w") as log_file:
+                        log_file.write(f"Task {task_name} exceeded dynamic limit at iteration {iteration}.\nLast Output:\n{last_execution_output}")
+                        
+                    os.rename(task_path, os.path.join(FAILED_DIR, task_name))
+                    break
                 
                 feedback_msg = (
                     f"Result of previous step / execution output:\n{last_execution_output}\n\n"
-                    "⚠️ REMINDER: YOUR WORKING DIRECTORY IS /workspace. "
-                    "All project files, source code, and custom directories MUST be created inside /workspace (e.g., mkdir /workspace/office-game).\n\n"
-                    "Determine the next action. Output <commands>...</commands> if you need to run code, "
-                    "<search>...</search> if you need to look up documentation, and specify <status>CONTINUE</status> or <status>COMPLETE</status>."
+                    f"⚠️ TIMELINE TRACKER: In your last step, you estimated **{previous_estimate}** steps remaining. "
+                    "Make sure your new <estimated_steps> count reflects a realistic countdown as you get closer to completion.\n\n"
+                    "⚠️ REMINDER: YOUR WORKING DIRECTORY IS /workspace.\n"
+                    "Determine the next action. Output <commands>...</commands>, <search>...</search>, "
+                    "your updated estimated remaining steps in <estimated_steps>X</estimated_steps>, "
+                    "and specify <status>CONTINUE</status> or <status>COMPLETE</status>."
                 )
                 conversation_history.append({"role": "user", "content": feedback_msg})
                 
@@ -293,37 +309,52 @@ def process_queue(enable_internet: bool):
                 
                 status = extract_tag_content(model_reply, "status").upper()
                 
-                # 1. Check web search request
+                # Parse estimate and dynamically update the hybrid budget
+                est_steps_str = extract_tag_content(model_reply, "estimated_steps")
+                if est_steps_str.isdigit():
+                    remaining_estimate = int(est_steps_str)
+                    previous_estimate = est_steps_str
+                    
+                    # Hybrid calculation: current iteration + remaining estimate + buffer, capped by absolute ceiling
+                    dynamic_task_limit = min(iteration + remaining_estimate + buffer_steps, absolute_max_ceiling)
+                    print(f"[*] Model updated estimate: {remaining_estimate} remaining. New dynamic budget limit: step {dynamic_task_limit}")
+                
                 search_query = extract_tag_content(model_reply, "search")
                 if search_query and enable_internet:
                     search_results = search_web(search_query)
                     last_execution_output = search_results
-                    print(f"[Search Result Output Provided to Model]")
+                    consecutive_no_command_turns = 0
                     continue
                 
-                # 2. Extract, Validate, and Audit bash commands with Feedback Loops
                 commands = extract_tag_content(model_reply, "commands")
                 if commands:
-                    # Step A: Fast model path validator check
+                    consecutive_no_command_turns = 0
+                    
                     is_valid, validation_msg = validate_commands_with_fast_model(commands)
                     if not is_valid:
                         print("[❌ Path Rejected] Fast model flagged incorrect path usage.")
                         last_execution_output = validation_msg
-                        continue  # Feed warning back to heavy model
+                        continue
                     
-                    # Step B: Security auditor check (Now a soft-block feedback loop instead of a hard crash!)
                     is_safe, audit_msg = audit_code_safety(commands)
                     if not is_safe:
-                        print("[❌ Auditor Blocked] Flagged as risky. Feeding reason back to heavy model.")
+                        print("[❌ Auditor Blocked] Flagged as risky. Feeding reason back to model.")
                         last_execution_output = audit_msg
-                        continue  # Feed auditor warning back to heavy model so it can rewrite the command!
+                        continue
                     
-                    # Step C: Execute in sandbox
                     last_execution_output = run_in_sandbox(commands)
                 else:
+                    consecutive_no_command_turns += 1
                     last_execution_output = "No commands were provided in this step."
+                    
+                    if consecutive_no_command_turns >= 3 and status != "COMPLETE":
+                        print("[*] Model is reasoning without executing commands. Injecting nudge...")
+                        conversation_history.append({
+                            "role": "user",
+                            "content": "⚠️ You have spent several turns discussing without running commands. Please write your next actions in <commands>...</commands> or finalize with <status>COMPLETE</status>."
+                        })
+                        consecutive_no_command_turns = 0
                 
-                # 3. Strict Completion Evaluation
                 if status == "COMPLETE":
                     print(f"[✓] Task {task_name} marked COMPLETE by model.")
                     task_success = True
@@ -334,21 +365,18 @@ def process_queue(enable_internet: bool):
                 else:
                     print("[*] No explicit status tag found. Continuing loop...")
 
-            # Save log file
-            log_filename = os.path.join(LOGS_DIR, f"log_{task_name}")
-            with open(log_filename, "w") as log_file:
-                log_file.write(
-                    f"Task: {task_name}\n"
-                    f"Status: {'SUCCESS' if task_success else 'COMPLETED WITH LIMITS / FAILED'}\n\n"
-                    f"Final Reasoning & Output Summary:\n{final_summary or last_execution_output}"
-                )
-            
-            print(f"🧠 Log saved to {log_filename}")
-            
-            # Archive task file
-            completed_path = os.path.join(COMPLETED_DIR, task_name)
-            os.rename(task_path, completed_path)
-            print(f"[✓] Task {task_name} archived.")
+            if task_success:
+                log_filename = os.path.join(LOGS_DIR, f"log_{task_name}")
+                with open(log_filename, "w") as log_file:
+                    log_file.write(
+                        f"Task: {task_name}\nStatus: SUCCESS\n\n"
+                        f"Final Reasoning & Output Summary:\n{final_summary or last_execution_output}"
+                    )
+                print(f"🧠 Log saved to {log_filename}")
+                
+                completed_path = os.path.join(COMPLETED_DIR, task_name)
+                os.rename(task_path, completed_path)
+                print(f"[✓] Task {task_name} archived.")
 
 
 if __name__ == "__main__":
