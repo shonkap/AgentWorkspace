@@ -1,3 +1,6 @@
 python3 worker.py --enable-internet
 
 python3 worker.py
+
+for venv ->
+	source venv/bin/activate

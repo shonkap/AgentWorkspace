@@ -26,7 +26,7 @@ IMAGE_NAME = "platformio-agent-sandbox:latest"
 SANDBOX_CONTAINER_NAME = "ai-sandbox"
 
 # Model configurations
-HEAVY_MODEL = "qwen3.6-27b-uncensored"
+HEAVY_MODEL = "deepseek-r1:32b"
 FAST_MODEL = "qwen2.5-coder:7b"
 
 HEAVY_HOST = "http://localhost:11434"
@@ -114,40 +114,46 @@ def search_web(query: str) -> str:
         return f"Web search error: {str(e)}"
 
 
-def run_in_sandbox(command: str) -> str:
-    """Executes a bash command safely inside the isolated Docker container with path auto-correction."""
+def validate_commands_with_fast_model(commands: str):
+    """Strict validator that instantly blocks any path containing a space after a slash (like / workspace)."""
+    print(f"[*] Fast model ({FAST_MODEL}) validating command paths and spacing...")
+    
+    prompt = (
+        "You are a strict syntax and path validator for an autonomous agent. "
+        "Review the following bash commands for path errors:\n\n"
+        "CRITICAL RULE:\n"
+        "1. BLOCK (INVALID) IMMEDIATELY if any path contains a space right after a slash, such as / workspace, '/ workspace/', or \"/ workspace/game.py\". "
+        "Linux paths cannot have spaces after slashes. They must always be written tightly as /workspace.\n"
+        "2. BLOCK (INVALID) if the agent tries to dump project files into root-level directories instead of /workspace.\n"
+        "3. ALLOW clean paths that correctly use /workspace or relative paths with zero spaces after slashes.\n\n"
+        "Format your reply strictly as:\n"
+        "STATUS: VALID or INVALID\n"
+        "REASON: (If invalid, state clearly: 'Forbidden space detected after slash. Change / workspace to /workspace.')\n\n"
+        f"Commands to review:\n{commands}"
+    )
+    
     try:
-        # Interceptor: catch model path typos like /workflow, /worksp, etc. 
-        # and force-rewrite them to /workspace so files always land in the right spot.
-        command = re.sub(r'/(workflow|worksp[a-zA-Z-]*)', '/workspace', command, flags=re.IGNORECASE)
-        
-        container = docker_client.containers.get(SANDBOX_CONTAINER_NAME)
-        print(f"\n[Sandbox] Running command in container:\n{command}")
-        
-        # Explicitly ensure /workspace exists inside the container first
-        container.exec_run(cmd=["mkdir", "-p", "/workspace"])
-        
-        # Run command with workdir set strictly to /workspace
-        result = container.exec_run(
-            cmd=["bash", "-c", command],
-            workdir="/workspace"
+        response = fast_client.chat(
+            model=FAST_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.0}
         )
+        reply = response['message']['content'].strip()
+        print(f"[Fast Validator Response]:\n{reply}")
         
-        output = result.output.decode("utf-8")
-        exit_code = result.exit_code
-        
-        combined_output = f"Exit Code: {exit_code}\nOutput:\n{output}"
-        print(f"[Sandbox Output]:\n{combined_output}")
-        return combined_output
-
+        if "STATUS: INVALID" in reply.upper():
+            reason = "Forbidden space detected after slash. You must use /workspace with no spaces."
+            if "REASON:" in reply:
+                reason = reply.split("REASON:")[-1].strip()
+            return False, f"⚠️ PATH VALIDATION FAILED:\n{reason}"
+            
+        return True, "OK"
     except Exception as e:
-        err_msg = f"Container execution error: {str(e)}"
-        print(f"[Error] {err_msg}")
-        return err_msg
+        print(f"[Warning] Fast model validation failed, defaulting to allow: {e}")
+        return True, "OK"
 
-
-def audit_code_safety(code_block: str) -> bool:
-    """Sends generated code to the fast auditor model."""
+def audit_code_safety(code_block: str) -> tuple[bool, str]:
+    """Sends generated code to the fast auditor model, returning (is_safe, reason)."""
     print(f"[Auditor] Sending code/commands to {FAST_MODEL}...")
     audit_prompt = (
         "You are a strict security auditor. Analyze the following shell commands/code. "
@@ -161,15 +167,57 @@ def audit_code_safety(code_block: str) -> bool:
             messages=[{"role": "user", "content": audit_prompt}],
             options={"temperature": 0.0}
         )
-        verdict = response['message']['content'].strip().upper()
+        verdict = response['message']['content'].strip()
         print(f"[Auditor Verdict]: {verdict}")
         
-        if "SAFE" in verdict and "UNSAFE" not in verdict:
-            return True
+        upper_verdict = verdict.upper()
+        if "SAFE" in upper_verdict and "UNSAFE" not in upper_verdict:
+            return True, "SAFE"
+            
+        reason = verdict.replace("UNSAFE", "").replace("unsafe", "").strip(":- ")
+        if not reason:
+            reason = "The security auditor flagged these commands as potentially hazardous."
+        return False, f"⚠️ SECURITY AUDITOR BLOCKED COMMANDS:\n{reason}\nPlease modify your command approach to be standard and safe."
     except Exception as e:
         print(f"[Warning] Fast model audit failed to respond: {e}")
+        return True, "SAFE"
+
+
+def run_in_sandbox(command: str) -> str:
+    """Executes bash commands directly inside the container, with strict output truncation to protect context."""
+    try:
+        container = docker_client.containers.get(SANDBOX_CONTAINER_NAME)
+        print(f"\n[Sandbox Exec]:\n{command}")
         
-    return False  # Fail-safe default
+        # Ensure /workspace exists inside the container
+        container.exec_run(cmd=["mkdir", "-p", "/workspace"])
+        
+        # Execute strictly inside /workspace so relative paths work automatically
+        result = container.exec_run(
+            cmd=["bash", "-c", command],
+            workdir="/workspace"
+        )
+        
+        output = result.output.decode("utf-8")
+        exit_code = result.exit_code
+        
+        # CRITICAL SAFETY NET: Truncate massive outputs to prevent context window token explosions
+        MAX_OUTPUT_CHARS = 4000
+        if len(output) > MAX_OUTPUT_CHARS:
+            output = (
+                output[:MAX_OUTPUT_CHARS] + 
+                f"\n\n[⚠️ WARNING: Output truncated! {len(output)} total characters generated. "
+                "Avoid recursive listings like 'ls -laR' or dumping large files directly into stdout.]"
+            )
+        
+        combined_output = f"Exit Code: {exit_code}\nOutput:\n{output}"
+        print(f"[Sandbox Output Length]: {len(combined_output)} chars")
+        return combined_output
+
+    except Exception as e:
+        err_msg = f"Container execution error: {str(e)}"
+        print(f"[Error] {err_msg}")
+        return err_msg
 
 
 def extract_tag_content(text: str, tag: str) -> str:
@@ -207,15 +255,15 @@ def process_queue(enable_internet: bool):
                     "content": (
                         "You are an autonomous background agent operating inside a secure Docker container. "
                         "**CRITICAL DIRECTORY RULE:** Your current working directory is **`/workspace`**. "
-                        "All files, directories, code scripts, and PlatformIO projects MUST be created and executed right here in `/workspace` (or relative to it). "
-                        "For complex code projects, build files incrementally across multiple steps rather than all at once to avoid token cutoff. "
-                        "Because `/workspace` is mounted to the local workspace folder next to the worker script, everything you build here will automatically save to your host machine.\n\n"
-                        "For each step, analyze what needs to be done. "
-                        "If you need to run bash commands, enclose them in <commands>...</commands>. "
-                        "If you need to search the web for documentation or answers (if enabled), enclose the query in <search>...</search>. "
-                        "When you have completely finished the task and verified success with working tests, write <status>COMPLETE</status>. "
-                        "If you need to continue to the next step or retry after an error, write <status>CONTINUE</status>.\n\n"
-                        f"Task Goal: {initial_prompt}"
+                        "All files, directories, code scripts, and projects MUST be created and executed right here in `/workspace` (or relative to it). "
+                        "\n\n🚨 **CRITICAL CODING RULE (NO MONOLITHIC FILES):** "
+                        "Never try to write a massive 300+ line script in a single command block, or your output will get cut off by token limits! "
+                        "Build projects incrementally: Create the base file first (e.g., using `touch` or a small skeleton), "
+                        "and then use python scripts or `cat << 'EOF' >> filename` to append classes, rooms, or logic step-by-step across multiple iterations. "
+                        "\n\nFor each step, analyze what needs to be done. "
+                        "Enclose bash commands in <commands>...</commands>, web search queries in <search>...</search>, "
+                        "and write <status>COMPLETE</status> when finished or <status>CONTINUE</status> to proceed."
+                        f"\n\nTask Goal: {initial_prompt}"
                     )
                 }
             ]
@@ -223,13 +271,15 @@ def process_queue(enable_internet: bool):
             last_execution_output = "No commands executed yet."
             final_summary = ""
             
-            # Open-ended loop governed by model status tags
+            # Open-ended loop governed by model status tags, with prompt reinforcement on every turn
             while not task_success:
                 iteration += 1
                 print(f"\n--- Autonomous Step {iteration} ---")
                 
                 feedback_msg = (
                     f"Result of previous step / execution output:\n{last_execution_output}\n\n"
+                    "⚠️ REMINDER: YOUR WORKING DIRECTORY IS /workspace. "
+                    "All project files, source code, and custom directories MUST be created inside /workspace (e.g., mkdir /workspace/office-game).\n\n"
                     "Determine the next action. Output <commands>...</commands> if you need to run code, "
                     "<search>...</search> if you need to look up documentation, and specify <status>CONTINUE</status> or <status>COMPLETE</status>."
                 )
@@ -251,14 +301,24 @@ def process_queue(enable_internet: bool):
                     print(f"[Search Result Output Provided to Model]")
                     continue
                 
-                # 2. Extract and audit bash commands
+                # 2. Extract, Validate, and Audit bash commands with Feedback Loops
                 commands = extract_tag_content(model_reply, "commands")
                 if commands:
-                    if not audit_code_safety(commands):
-                        print("[❌ Blocked] Auditor flagged task as risky. Stopping task.")
-                        last_execution_output = "Blocked by security auditor due to policy violation."
-                        break
+                    # Step A: Fast model path validator check
+                    is_valid, validation_msg = validate_commands_with_fast_model(commands)
+                    if not is_valid:
+                        print("[❌ Path Rejected] Fast model flagged incorrect path usage.")
+                        last_execution_output = validation_msg
+                        continue  # Feed warning back to heavy model
                     
+                    # Step B: Security auditor check (Now a soft-block feedback loop instead of a hard crash!)
+                    is_safe, audit_msg = audit_code_safety(commands)
+                    if not is_safe:
+                        print("[❌ Auditor Blocked] Flagged as risky. Feeding reason back to heavy model.")
+                        last_execution_output = audit_msg
+                        continue  # Feed auditor warning back to heavy model so it can rewrite the command!
+                    
+                    # Step C: Execute in sandbox
                     last_execution_output = run_in_sandbox(commands)
                 else:
                     last_execution_output = "No commands were provided in this step."
