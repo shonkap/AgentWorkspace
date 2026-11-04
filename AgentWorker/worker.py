@@ -309,7 +309,14 @@ def process_queue(enable_internet: bool):
                 
                 status = extract_tag_content(model_reply, "status").upper()
                 
-                # Parse estimate and dynamically update the hybrid budget
+                # 1. Check completion FIRST so task exits immediately without executing extra tools
+                if status == "COMPLETE":
+                    print(f"[✓] Task {task_name} marked COMPLETE by model.")
+                    task_success = True
+                    final_summary = model_reply
+                    break
+
+                # 2. Parse estimate and dynamically update hybrid budget
                 est_steps_str = extract_tag_content(model_reply, "estimated_steps")
                 if est_steps_str.isdigit():
                     remaining_estimate = int(est_steps_str)
@@ -319,6 +326,7 @@ def process_queue(enable_internet: bool):
                     dynamic_task_limit = min(iteration + remaining_estimate + buffer_steps, absolute_max_ceiling)
                     print(f"[*] Model updated estimate: {remaining_estimate} remaining. New dynamic budget limit: step {dynamic_task_limit}")
                 
+                # 3. Check web search request
                 search_query = extract_tag_content(model_reply, "search")
                 if search_query and enable_internet:
                     search_results = search_web(search_query)
@@ -326,6 +334,7 @@ def process_queue(enable_internet: bool):
                     consecutive_no_command_turns = 0
                     continue
                 
+                # 4. Extract, Validate, and Audit bash commands
                 commands = extract_tag_content(model_reply, "commands")
                 if commands:
                     consecutive_no_command_turns = 0
@@ -347,23 +356,13 @@ def process_queue(enable_internet: bool):
                     consecutive_no_command_turns += 1
                     last_execution_output = "No commands were provided in this step."
                     
-                    if consecutive_no_command_turns >= 3 and status != "COMPLETE":
+                    if consecutive_no_command_turns >= 3:
                         print("[*] Model is reasoning without executing commands. Injecting nudge...")
                         conversation_history.append({
                             "role": "user",
                             "content": "⚠️ You have spent several turns discussing without running commands. Please write your next actions in <commands>...</commands> or finalize with <status>COMPLETE</status>."
                         })
                         consecutive_no_command_turns = 0
-                
-                if status == "COMPLETE":
-                    print(f"[✓] Task {task_name} marked COMPLETE by model.")
-                    task_success = True
-                    final_summary = model_reply
-                    break
-                elif status == "CONTINUE" or commands:
-                    print("[*] Model decided to continue to next step...")
-                else:
-                    print("[*] No explicit status tag found. Continuing loop...")
 
             if task_success:
                 log_filename = os.path.join(LOGS_DIR, f"log_{task_name}")
