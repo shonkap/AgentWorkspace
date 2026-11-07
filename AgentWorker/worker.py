@@ -242,7 +242,8 @@ class TaskState:
     readonly_streak: int = 0
     protected: dict = field(default_factory=dict)        # rel path -> original text of files the agent must not change
     reads: dict = field(default_factory=dict)            # rel -> (content hash, set of line numbers shown) still in the history
-    protected_lines_read: dict = field(default_factory=dict)   # rel -> lines of a protected file shown so far
+    protected_lines_read: dict = field(default_factory=dict)
+    reshown: set = field(default_factory=set)            # small unchanged ranges already shown a second time   # rel -> lines of a protected file shown so far
     hard_lock: bool = False                              # this reply may not read at all (set after salvaged reasoning)
     blind_edits: int = 0                                 # consecutive turns that edited files without running anything
     read_locked: bool = False                            # reading is refused until the agent edits or runs something
@@ -988,7 +989,9 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
     if state.read_locked and len(new_lines) < 0.5 * len(wanted):
         return READ_LOCK_MSG
     small = len(wanted) <= 60
-    if small and not new_lines and not state.hard_lock:
+    reshow_key = (rel, start, req_end, digest)
+    if small and not new_lines and not state.hard_lock and reshow_key not in state.reshown:
+        state.reshown.add(reshow_key)
         # a few exact lines (usually to copy <old> text): cheaper to show them again than to argue
         end = max(start, req_end)
         body = "\n".join(f"{i:>5} | {all_lines[i - 1]}" for i in range(start, end + 1))
