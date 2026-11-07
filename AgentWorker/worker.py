@@ -227,6 +227,10 @@ class TaskState:
     status_block: str = ""                            # the latest authoritative status, shown on EVERY turn until replaced
     status_history: list = field(default_factory=list)   # failing-check sets of the periodic status checks
     readonly_streak: int = 0
+    protected: dict = field(default_factory=dict)        # rel path -> original text of files the agent must not change
+    reads: dict = field(default_factory=dict)            # (rel, lines) -> (content hash, turn) of reads still in the history
+    read_locked: bool = False                            # reading is refused until the agent edits or runs something
+    iteration: int = 0
     last_readonly_nudge: int = 0
     learned: list = field(default_factory=list)          # LEARNED: lines from the model's own replies
     plan: str = ""                                       # its latest PLAN: line
@@ -271,13 +275,46 @@ def parse_task_file(text: str) -> tuple[str, list[str], Optional[str]]:
     verify = [m.group(1).strip() for m in re.finditer(r"^\s*VERIFY:\s*(.+?)\s*$", text, re.IGNORECASE | re.MULTILINE)]
     m = re.search(r"^\s*WORKDIR:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)
     workdir = os.path.basename(m.group(1).rstrip("/")) if m else None
-    goal = re.sub(r"^\s*(?:VERIFY|WORKDIR|REQUIRE):.*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+    goal = re.sub(r"^\s*(?:VERIFY|WORKDIR|REQUIRE|PROTECT):.*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
     return goal, [v for v in verify if v], workdir
 
 
 def parse_required_files(text: str) -> list[str]:
     """`REQUIRE: some_file.py` lines name files that must already exist in the working directory."""
     return [m.group(1) for m in re.finditer(r"^\s*REQUIRE:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)]
+
+
+def parse_protected_files(text: str) -> list[str]:
+    """`PROTECT: judge.py` lines name files the agent may read and run but never change (checkers, reference tests).
+    The harness refuses edits to them and restores them if a shell command changed them."""
+    return [m.group(1) for m in re.finditer(r"^\s*PROTECT:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)]
+
+
+def snapshot_protected(state: "TaskState", paths: list[str]) -> list[str]:
+    """Remember the exact contents of the protected files. Returns the ones that could not be read."""
+    missing = []
+    for p in paths:
+        abs_path = posixpath.join(state.container_dir, p)
+        text, _ = container_read(abs_path)
+        if text is None:
+            missing.append(p)
+        else:
+            state.protected[posixpath.normpath(p)] = text
+    return missing
+
+
+def restore_protected(state: "TaskState") -> list[str]:
+    """Put back any protected file that a command modified or deleted. Returns the restored paths."""
+    restored = []
+    for rel, text in state.protected.items():
+        abs_path = posixpath.join(state.container_dir, rel)
+        now, _ = container_read(abs_path)
+        if now != text:
+            container_write(abs_path, text)
+            restored.append(rel)
+    if restored:
+        state.events.emit("protected_restored", files=restored)
+    return restored
 
 
 # ================= SAFETY LAYERS =================
@@ -353,6 +390,31 @@ def truncate_output(text: str, limit: Optional[int] = None) -> str:
     head = limit // 2
     tail = limit - head
     return f"{text[:head]}\n\n[... {len(text) - limit} characters omitted ...]\n\n{text[-tail:]}"
+
+
+PASS_LINE_RE = re.compile(r"^\s*(?:PASS(?:ED)?\b|ok\b|✓|\[\s*OK\s*\])|(?:\.\.\.|::\S*)\s+(?:ok|PASSED)\s*$")
+
+
+def compress_output(text: str) -> str:
+    """Test runners and checkers print hundreds of passing lines, and head+tail truncation then hides the failures in
+    the middle. Collapse runs of passing lines into one counter line so every FAIL/error line stays visible."""
+    lines = text.splitlines()
+    passes = sum(1 for l in lines if PASS_LINE_RE.search(l))
+    if passes < 8:
+        return text
+    out: list[str] = []
+    run = 0
+    for line in lines:
+        if PASS_LINE_RE.search(line):
+            run += 1
+            continue
+        if run:
+            out.append(f"  [{run} passing line(s) hidden]")
+            run = 0
+        out.append(line)
+    if run:
+        out.append(f"  [{run} passing line(s) hidden]")
+    return f"[{passes} passing lines collapsed by the harness; every other line is shown]\n" + "\n".join(out)
 
 
 def strip_thinking(text: str) -> str:
@@ -597,7 +659,7 @@ def execute_run_command(state: TaskState, command: str) -> str:
     if exit_code == 0:
         state.unverified_changes = False
 
-    report = f"Exit Code: {exit_code}\nOutput:\n{truncate_output(output)}"
+    report = f"Exit Code: {exit_code}\nOutput:\n{truncate_output(compress_output(output))}"
 
     if exit_code in (124, 137):
         report += f"\n\n[INSPECTOR ALERT]: Command hit the {CFG.command_timeout}s timeout and was killed. Avoid interactive or long-running commands."
@@ -659,6 +721,9 @@ def execute_write_file(state: TaskState, path: str, content: str) -> str:
         abs_path, rel = resolve_container_path(state, path, for_write=True)
     except ValueError as e:
         return f"Failed to write file: {e}"
+    if rel in state.protected:
+        return (f"REFUSED: {rel} is a protected file (a checker or reference the task forbids changing). Change YOUR code "
+                "so that it passes instead; you may read and run the protected file.")
 
     text = content.replace("\xa0", " ")
     if text.startswith("\n"):
@@ -684,6 +749,9 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
         abs_path, rel = resolve_container_path(state, path, for_write=True)
     except ValueError as e:
         return f"Failed to edit file: {e}"
+    if rel in state.protected:
+        return (f"REFUSED: {rel} is a protected file (a checker or reference the task forbids changing). Change YOUR code "
+                "so that it passes instead; you may read and run the protected file.")
 
     text, err = container_read(abs_path)
     if text is None:
@@ -709,8 +777,15 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
     return f"Successfully edited {state.container_dir}/{rel} (1 replacement)"
 
 
+READ_LOCK_MSG = ("REFUSED: reading is locked because you have only read files for many turns. You already have enough "
+                 "information. This turn you MUST change something (write_file / replace_in_file) or run a command "
+                 "(for example an acceptance check). Reading unlocks as soon as you do.")
+
+
 def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) -> str:
     state.tool_calls += 1
+    if state.read_locked:
+        return READ_LOCK_MSG
     try:
         abs_path, rel = resolve_container_path(state, path)
     except ValueError as e:
@@ -718,6 +793,13 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
     text, err = container_read(abs_path)
     if text is None:
         return f"Failed to read file: {rel} {err}."
+    key = (rel, (lines_spec or "").replace(" ", ""))
+    digest = short_hash(text)
+    prev = state.reads.get(key)
+    if prev and prev[0] == digest:
+        return (f"{rel} is UNCHANGED since you read it at turn {prev[1]}; that result is still in this conversation above. "
+                "Do not read it again: use what you already have, and act (edit or run).")
+    state.reads[key] = (digest, state.iteration)
     if "\x00" in text[:2048]:
         return f"{rel} looks like a binary file."
 
@@ -736,6 +818,8 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
 
 def execute_list_dir(state: TaskState, path: str) -> str:
     state.tool_calls += 1
+    if state.read_locked:
+        return READ_LOCK_MSG
     try:
         abs_path, rel = resolve_container_path(state, path or ".", allow_root=True)
     except ValueError as e:
@@ -1051,11 +1135,13 @@ def build_system_prompt(state: TaskState) -> str:
         "the harness checkpoints your work automatically.\n"
         f"5. Commands are killed after {CFG.command_timeout}s. Never run interactive or never-ending commands.\n"
         "6. Keep each file under ~300 lines and each reply reasonably short; overlong replies get cut off and lose their tool calls.\n"
-        "7. Tool calls in one reply run in order, but you only see their results afterwards. Batch independent calls "
-        "into ONE reply (for example read several files at once) instead of one call per turn; turns are limited.\n"
+        "7. Tool calls in one reply run in order, but you only see their results afterwards, and turns are limited. "
+        "Do several steps per reply: read ALL the files you need in one reply; and after an edit, put the command that "
+        "tests it (for example an acceptance check) in the SAME reply, after the edit.\n"
         "8. If you keep getting the same result, change your approach instead of repeating yourself.\n"
-        "9. NEVER answer with a tutorial, a plan, or markdown code blocks: the harness can only act on tool tags. "
-        "Every reply must contain tool tags (or <status>COMPLETE</status>); put code inside <write_file>.\n"
+        "9. Never answer with a tutorial or markdown code blocks: the harness can only act on tool tags. Every reply must "
+        "contain tool tags (or <status>COMPLETE</status>); put code inside <write_file>. Progress means CHANGING files: "
+        "after you have read the relevant code once, edit it; do not keep re-reading.\n"
         "10. There is no display. Programs with an endless loop (games, servers) must be able to exit on their own, "
         "e.g. via a --frames N flag, so that you can run and verify them.\n"
         + ("11. End EVERY reply with <turns_left>N</turns_left>: your honest estimate of how many more turns you need to "
@@ -1092,6 +1178,9 @@ def build_task_prompt(state: TaskState, goal: str) -> str:
         checks = "\n".join(f"- {c}" for c in state.verify_cmds)
         parts.append("Acceptance checks (run automatically by the harness when you declare completion; "
                      f"you may run them yourself first, from {state.container_dir}):\n{checks}")
+    if state.protected:
+        parts.append("PROTECTED files (read and run them, never change them; the harness refuses edits and restores them): "
+                     + ", ".join(sorted(state.protected)))
     if CFG.isolate_tasks:
         parts.append(f"Note: your working directory is {state.container_dir}. A path in the goal that names this project "
                      "(e.g. /workspace/office-game) means this directory. Other files under /workspace, such as shared "
@@ -1400,7 +1489,7 @@ def run_acceptance_checks(state: TaskState) -> Optional[str]:
         state.events.emit("verify", cmd=cmd, exit_code=code)
         if code != 0:
             return (f"ACCEPTANCE CHECK FAILED\nCommand: {cmd}\nExit Code: {code}\n"
-                    f"Output:\n{truncate_output(out)}")
+                    f"Output:\n{truncate_output(compress_output(out))}")
         if HIDDEN_ERROR_RE.search(out):
             return (f"ACCEPTANCE CHECK FAILED (hidden error)\nCommand: {cmd}\nIt exited 0 but its output contains an error "
                     f"message: {HIDDEN_ERROR_ADVICE}.\nOutput:\n{truncate_output(out)}")
@@ -1428,6 +1517,12 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
         state.events.emit("task_start_refused", missing=missing)
         return False, reason, transcript
     state.verify_cmds = verify_cmds
+    unreadable = snapshot_protected(state, parse_protected_files(raw))
+    if unreadable:
+        reason = f"Protected file(s) missing from {state.container_dir}: {', '.join(unreadable)}."
+        print(f"[!] {reason}")
+        state.events.emit("task_start_refused", missing=unreadable)
+        return False, reason, transcript
     state.preexisting_files = container_dir_has_files(state.container_dir)
     state.base_prompt = build_task_prompt(state, goal)
     git_init(state, attempt)
@@ -1556,7 +1651,7 @@ def consolidate_notes(state: TaskState, history: list[dict], iteration: int) -> 
                                               "State ONLY facts that appear in the text you are given and NEVER guess causes. If an AUTHORITATIVE STATUS shows an "
                                               "error message, your first LEARNED line must quote it exactly with its file and line. Output ONLY: up to 4 lines "
                                               "starting with `LEARNED:` (one concrete fact each) and exactly one line starting with `PLAN:` (the next 2-3 "
-                                              "concrete steps; if there is a crash, the first step is to run the game and fix that error). No other text, "
+                                              "concrete steps; if there is a crash, the first step is to fix that error). No other text, "
                                               "no tool calls."},
                 {"role": "user", "content": prompt}]
     state.last_notes_turn = iteration
@@ -1621,8 +1716,8 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
     if snippets:
         extra.append(snippets)
     if crash:
-        extra.append("A crash comes first: nothing else can pass until the game starts. Reproduce it yourself with "
-                     "`python3 tamagotchi/main.py --frames 5 2>&1 | tail -20`, open the file and line named in the error, and fix THAT.")
+        extra.append("A crash comes first: nothing else can pass until the program starts. Fix the error at the file and line "
+                     "named above FIRST (the SOURCE lines show the code), then rerun the check.")
     names = frozenset(n for n, _ in pairs)
     state.status_history.append(names)
     last3 = state.status_history[-3:]
@@ -1695,6 +1790,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
     iteration = 0
     while True:
         iteration += 1
+        state.iteration = iteration
         if iteration > limit:
             done = try_auto_complete(state, "the turn budget was reached")
             if done:
@@ -1723,6 +1819,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
 
         dropped = trim_history(history)
         if dropped:
+            state.reads.clear()          # the trimmed turns held those file contents: re-reading is legitimate again
             state.notes = summarize_dropped(dropped, state.notes, state)
             history[1]["content"] = render_task_message(state)
             state.events.emit("history_trimmed", dropped=len(dropped), notes_chars=len(state.notes))
@@ -1855,19 +1952,26 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             if done:
                 transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
                 return True, done
-        if all(kind in ("read_file", "list_dir", "view_image") for kind, _ in calls):
+        if all(kind in ("read_file", "list_dir", "view_image", "search_web") for kind, _ in calls):
             state.readonly_streak += 1
         else:
             state.readonly_streak = 0
-        if state.readonly_streak >= CFG.readonly_nudge and iteration - state.last_readonly_nudge >= CFG.readonly_nudge:
+            state.read_locked = False
+        if state.readonly_streak >= CFG.readonly_nudge and not state.read_locked:
+            state.read_locked = True
             state.last_readonly_nudge = iteration
             state.events.emit("readonly_nudge", turn=iteration, streak=state.readonly_streak)
-            text = (f"NUDGE: you have only READ files for {state.readonly_streak} turns in a row (no command run, no edit). Reading more will not find the "
-                    "bug. RUN something now: the game (`python3 tamagotchi/main.py --frames 5 2>&1 | tail -20`) or the checker, read the FIRST error "
-                    "line, open exactly the file and line it names, and fix it.")
-            log_to_transcript(state, f"=== Read-only nudge at turn {iteration} ===\n{text}")
+            first = state.verify_cmds[0] if state.verify_cmds else "your program or its tests"
+            text = (f"NUDGE: you have only READ for {state.readonly_streak} turns in a row (no edit, no command). Reading is now LOCKED "
+                    "until you edit a file or run a command. Make the change you already know is needed, or run "
+                    f"`{first}` and fix the FIRST failure it reports.")
+            log_to_transcript(state, f"=== Read-only lock at turn {iteration} ===\n{text}")
             state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + text
         notes = list(nudges)
+        restored = restore_protected(state)
+        if restored:
+            notes.append(f"WARNING: you changed protected file(s) {', '.join(restored)}; the harness restored the originals. "
+                         "Never modify them: change your own code so it passes.")
         auto_note = maybe_auto_attach_image(state, iteration, outputs)
         if auto_note:
             notes.append(auto_note)
@@ -1901,9 +2005,9 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         history.append({
             "role": "user",
             "content": (f"Tool Execution Results:\n{combined}\n\n"
-                        "Review the outputs above. If any tool failed or produced empty files, fix it immediately. "
-                        "Otherwise continue, or write <status>COMPLETE</status> once the final state is verified. "
-                        "Reply with tool tags only, no explanations."
+                        "Review the outputs above. If something failed, fix its cause now (edit the code, then rerun the check in the same "
+                        "reply). Otherwise continue, or write <status>COMPLETE</status> once the final state is verified. "
+                        "Start with the LEARNED:/PLAN: lines, then the tool tags."
                         + (" End your reply with <turns_left>N</turns_left>." if CFG.ask_turns_left else "")),
         })
 
