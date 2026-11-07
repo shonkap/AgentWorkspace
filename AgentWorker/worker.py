@@ -987,6 +987,13 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
         return HARD_LOCK_MSG
     if state.read_locked and len(new_lines) < 0.5 * len(wanted):
         return READ_LOCK_MSG
+    small = len(wanted) <= 60
+    if small and not new_lines and not state.hard_lock:
+        # a few exact lines (usually to copy <old> text): cheaper to show them again than to argue
+        end = max(start, req_end)
+        body = "\n".join(f"{i:>5} | {all_lines[i - 1]}" for i in range(start, end + 1))
+        return (f"{state.container_dir}/{rel} (lines {start}-{end} of {len(all_lines)}, UNCHANGED since you last read them; "
+                f"shown again):\n{body}")
     if not new_lines:
         return (f"{rel} lines {start}-{max(start, req_end)} are UNCHANGED since you read them; that result is still in this conversation "
                 "above. Do not read them again: use what you already have, and act (edit or run).")
