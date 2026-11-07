@@ -847,8 +847,17 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
         return "Failed to edit file: <old> is empty."
     count = text.count(old_s)
     if count == 0:
-        return (f"Failed to edit {rel}: <old> text was not found. It must match the file exactly, including "
-                "whitespace. Use read_file to see the current contents.")
+        fuzzy = fuzzy_replace(text, old_s, new_s)
+        if isinstance(fuzzy, str):
+            return f"Failed to edit {rel}: {fuzzy}"
+        new_text, where = fuzzy
+        print(f"\n[Tool: replace_in_file] Editing {state.container_dir}/{rel} (whitespace-tolerant match at line {where})")
+        err = container_write(abs_path, new_text)
+        if err:
+            return f"Failed to edit file: {err}"
+        state.unverified_changes = True
+        return (f"Successfully edited {state.container_dir}/{rel} (1 replacement at line {where}; <old> matched only when "
+                "ignoring indentation, so the indentation of the file was kept)")
     if count > 1:
         return f"Failed to edit {rel}: <old> matches {count} places. Include more surrounding lines so it matches exactly once."
 
@@ -863,6 +872,57 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
 READ_LOCK_MSG = ("REFUSED: re-reading files and list_dir are locked because you have read for many turns without changing "
                  "anything. You already read this file; its contents are above. Make the change you believe is needed NOW (replace_in_file / write_file); "
                  "reading unlocks as soon as you edit a file. If you need one exact line, use run_command with grep -n.")
+
+
+def _indent(line: str) -> str:
+    return line[:len(line) - len(line.lstrip())]
+
+
+def fuzzy_replace(text: str, old: str, new: str):
+    """<old> was not found verbatim. Try matching line by line with leading/trailing whitespace ignored; on a unique match
+    replace those lines and re-indent <new> to fit the file. Returns (new_text, line_number) or an error message that
+    shows the closest region of the file."""
+    import difflib
+    lines = text.split("\n")
+    old_lines = [l for l in old.split("\n")]
+    while old_lines and not old_lines[0].strip():
+        old_lines.pop(0)
+    while old_lines and not old_lines[-1].strip():
+        old_lines.pop()
+    if not old_lines:
+        return "<old> is empty."
+    key = [l.strip() for l in old_lines]
+    n = len(key)
+    hits = [i for i in range(len(lines) - n + 1) if [l.strip() for l in lines[i:i + n]] == key]
+    if len(hits) == 1:
+        i = hits[0]
+        file_ind = [_indent(l) for l in lines[i:i + n]]
+        old_ind = [_indent(l) for l in old_lines]
+        new_lines = new.split("\n")
+        deltas = {len(f) - len(o) for f, o in zip(file_ind, old_ind)}
+        if len(deltas) == 1:
+            d = deltas.pop()
+            fixed = [(" " * d + l) if d >= 0 else (l[min(-d, len(_indent(l))):]) for l in new_lines]
+        elif len(new_lines) == n:
+            fixed = [file_ind[k] + l.lstrip() if l.strip() else l for k, l in enumerate(new_lines)]
+        else:
+            d = len(file_ind[0]) - len(old_ind[0])
+            fixed = [(" " * d + l) if d >= 0 else (l[min(-d, len(_indent(l))):]) for l in new_lines]
+        return "\n".join(lines[:i] + fixed + lines[i + n:]), i + 1
+    if len(hits) > 1:
+        return (f"<old> matches {len(hits)} places (ignoring whitespace) at lines {', '.join(str(h + 1) for h in hits[:6])}. "
+                "Include more surrounding lines so it matches exactly once.")
+    # no match: show the most similar window so the model can copy the real text
+    best, best_i = 0.0, 0
+    first = key[0]
+    for i in range(len(lines)):
+        r = difflib.SequenceMatcher(None, lines[i].strip(), first).ratio()
+        if r > best:
+            best, best_i = r, i
+    lo, hi = max(0, best_i - 2), min(len(lines), best_i + n + 3)
+    snippet = "\n".join(f"{k + 1:>5} | {lines[k]}" for k in range(lo, hi))
+    return ("<old> text was not found (not even ignoring whitespace). The most similar part of the file is shown below; copy "
+            f"<old> EXACTLY from it (without the line numbers), or read the file again:\n{snippet}")
 
 
 def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) -> str:
@@ -2224,7 +2284,8 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             notes.append("NOTE: Your <status>COMPLETE</status> was ignored because you had not yet seen these results. "
                          "Re-issue it once everything is verified.")
 
-        edited = any(k in ("write_file", "replace_in_file") for k, _ in calls)
+        edited = any(k in ("write_file", "replace_in_file") and o.split("Output:\n", 1)[-1].startswith("Successfully")
+                     for (k, _), o in zip(calls, outputs))
         ran = any(k == "run_command" for k, _ in calls)
         state.blind_edits = state.blind_edits + 1 if (edited and not ran) else (0 if ran else state.blind_edits)
         if edited and not ran and state.quick_cmds and not wants_complete:

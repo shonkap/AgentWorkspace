@@ -126,6 +126,15 @@ class Tests(unittest.TestCase):
         self.assertIn("... FAIL", W.compress_output(ut))
         self.assertIn("10 passing", W.compress_output(ut))
 
+    def test_fuzzy_replace(self):
+        f = "def a():\n    # Body/torso\n    draw(x, y+20+ao[0])\n    more()\n"
+        self.assertEqual(W.fuzzy_replace(f, "    # Body/torso\n        draw(x, y+20+ao[0])", "    # Body\n        draw(x, y+20)"),
+                         ("def a():\n    # Body\n    draw(x, y+20)\n    more()\n", 2))
+        self.assertEqual(W.fuzzy_replace(f, "# Body/torso\ndraw(x, y+20+ao[0])", "if q:\n    draw(x, y)"),
+                         ("def a():\n    if q:\n        draw(x, y)\n    more()\n", 2))
+        self.assertIn("most similar part", W.fuzzy_replace(f, "    draw(x, y+21+ao[0])", "z"))
+        self.assertIn("matches 2 places", W.fuzzy_replace("  a\nb\n  a\n", "a", "c"))
+
     def test_success_and_auto_verify(self):
         sb, model = make_env(self, {"check.py": CHECK}, [
             "PLAN: run\n<run_command>python3 check.py</run_command>",
