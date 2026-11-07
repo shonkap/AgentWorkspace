@@ -232,6 +232,10 @@ class TaskState:
     last_self_notes_turn: int = 0
     last_status_turn: int = 0
     status_block: str = ""                            # the latest authoritative status, shown on EVERY turn until replaced
+    status_pairs: list = field(default_factory=list)  # [(check name, reason)] still failing per the latest status
+    status_turn: int = 0
+    status_extra: list = field(default_factory=list)
+    status_fixed: list = field(default_factory=list)
     status_history: list = field(default_factory=list)   # failing-check sets of the periodic status checks
     readonly_streak: int = 0
     protected: dict = field(default_factory=dict)        # rel path -> original text of files the agent must not change
@@ -742,6 +746,8 @@ def execute_run_command(state: TaskState, command: str) -> str:
     if exit_code == 0:
         state.unverified_changes = False
 
+    if not is_check:
+        prune_status(state, output)      # e.g. a partial checker run shows checks that pass now
     report = f"Exit Code: {exit_code}\nOutput:\n{truncate_output(compress_output(output))}"
 
     if exit_code in (124, 137):
@@ -1947,6 +1953,36 @@ def source_snippets(state: TaskState, failure: str, limit: int = 2) -> str:
     return "\n".join(blocks)
 
 
+def build_status_block(state: TaskState) -> str:
+    pairs = state.status_pairs
+    reasons = [f"{n} -> {r[:300 if k < 3 else 140]}" for k, (n, r) in enumerate(pairs[:8])]
+    more = f"\n- ... and {len(pairs) - 8} more failing check(s)" if len(pairs) > 8 else ""
+    fixed = (f"\nNow PASSING in a later quick check (fixed since): " + "; ".join(state.status_fixed[:6])) if state.status_fixed else ""
+    focus = ""
+    if pairs:
+        n0, r0 = pairs[0]
+        focus = (f"\nFOCUS NOW: fix exactly this one check in your next reply, then rerun the checks: `{n0}` -> {r0[:400]}\n"
+                 "Find the code responsible (you have read it), change it with replace_in_file, and run the check in the same reply.")
+    return (f"AUTHORITATIVE STATUS (acceptance checks run by the harness at turn {state.status_turn}; this is newer and more reliable "
+            "than anything you remember or wrote in older notes):\n" + "\n".join(f"- {r}" for r in reasons) + more + fixed
+            + ("\n" + "\n".join(state.status_extra) if state.status_extra else "") + focus)
+
+
+def prune_status(state: TaskState, output: str) -> None:
+    """A quick check printed PASS for checks the pinned status still lists as failing: drop them and move FOCUS on."""
+    if not state.status_pairs:
+        return
+    passed = {m.strip() for m in re.findall(r"^PASS\s+(.+?)\s*$", output, re.MULTILINE)}
+    keep = [(n, r) for n, r in state.status_pairs if n not in passed]
+    gone = [n for n, _ in state.status_pairs if n in passed]
+    if gone:
+        state.status_pairs = keep
+        state.status_fixed += gone
+        state.status_block = build_status_block(state) if keep else (
+            "AUTHORITATIVE STATUS: every check that failed at the last full run now passes in the quick checks. Run the full "
+            "acceptance checks to confirm: " + ", ".join(state.verify_cmds))
+
+
 def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
     """Run the acceptance checks ourselves, whatever the model printed or piped through tail/grep, and tell it the exact result.
     Returns a success reason if everything passes and nothing blocks completion."""
@@ -1981,14 +2017,11 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
     if len(last3) == 3 and names and last3[0] == last3[1] == last3[2]:
         stuck = (f"The same {len(names)} check(s) have failed at the last 3 status checks (about {3 * CFG.status_every} turns). Your current approach "
                  "is not working. Stop reading and theorizing: run the failing thing, read its first error line, and change code.")
-    focus = ""
-    if pairs:
-        n0, r0 = pairs[0]
-        focus = (f"\nFOCUS NOW: fix exactly this one check in your next reply, then rerun the checks: `{n0}` -> {r0[:400]}\n"
-                 "Find the code responsible (you have read it), change it with replace_in_file, and run the check in the same reply.")
-    state.status_block = (f"AUTHORITATIVE STATUS (acceptance checks run by the harness at turn {iteration}; this is newer and more reliable than "
-                          f"anything you remember or wrote in older notes):\n{body}" + ("\n" + "\n".join(extra) if extra else "") + (f"\n{stuck}" if stuck else "")
-                          + focus)
+    state.status_pairs, state.status_turn = pairs, iteration
+    state.status_extra = extra + ([stuck] if stuck else [])
+    state.status_fixed = []
+    state.status_block = build_status_block(state) if pairs else (
+        f"AUTHORITATIVE STATUS (acceptance checks run by the harness at turn {iteration}):\n{body}")
     state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + (plateau or "")
     log_to_transcript(state, f"=== Status check at turn {iteration} ===\n{state.status_block}")
     state.events.emit("status_check", turn=iteration, failing=len(reasons))
@@ -2292,6 +2325,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             for qc in state.quick_cmds:
                 code, out = container_exec(state, fix_command_paths(qc), timeout=180)
                 state.events.emit("quick_check", turn=iteration, cmd=qc, exit_code=code)
+                prune_status(state, out)
                 notes.append(f"QUICK CHECK run by the harness after your edit: {qc}\nExit Code: {code}\n"
                              + truncate_output(compress_output(out), 4000))
                 if code != 0:

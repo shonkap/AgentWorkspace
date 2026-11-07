@@ -216,6 +216,15 @@ class Tests(unittest.TestCase):
         self.assertIn("QUICK CHECK run by the harness after your edit: cat val.txt\nExit Code: 0\n7", model.seen[1][-1]["content"])
         self.assertNotIn("QUICKCHECK", model.seen[0][1]["content"])
 
+    def test_prune_status(self):
+        sb, model = make_env(self, {"check.py": CHECK}, ["<run_command>echo 'PASS  val exists'</run_command>", "<list_dir/>"],
+                             max_iterations=2, status_every=0)
+        W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
+        first, second = model.seen[0][-1]["content"], model.seen[1][-1]["content"]
+        self.assertIn("FOCUS NOW: fix exactly this one check in your next reply, then rerun the checks: `val exists`", first)
+        self.assertIn("FOCUS NOW: fix exactly this one check in your next reply, then rerun the checks: `val is 42`", second)
+        self.assertIn("Now PASSING in a later quick check (fixed since): val exists", second)
+
     def test_initial_status_and_code_map(self):
         sb, model = make_env(self, {"check.py": CHECK, "lib.py": "class Foo:\n    def bar(self):\n        pass\n"},
                              ["<list_dir/>"], max_iterations=1, status_every=0)
