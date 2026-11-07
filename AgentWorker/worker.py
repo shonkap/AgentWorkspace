@@ -84,6 +84,7 @@ class Config:
     initial_status: bool = True           # existing project: run the checks before turn 1 and pin the failures
     code_map: bool = True                 # existing project: show a file/definition outline in the task prompt
     protected_read_lines: int = 200       # read_file shows at most this many lines of each PROTECTED file per task
+    salvage_thinking_chars: int = 3000    # when thinking eats the whole reply budget, show the model this much of its tail
     blind_edit_limit: int = 3             # after this many edit-only turns in a row, the harness runs the checks even if slow
     min_read_lines: int = 150             # read_file ranges smaller than this are widened (0 = off)
     readonly_nudge: int = 8               # this many turns of ONLY reading (no command, no edit) triggers a 'run something' nudge
@@ -2215,7 +2216,15 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
                 state.events.emit("thinking_budget_exhausted", think_chars=think_chars)
             if state.no_tool_streak >= CFG.max_no_tool_streak:
                 return False, f"Model replied {state.no_tool_streak} times in a row without using any tools."
-            if hit_limit or unclosed or not clean:
+            if hit_limit and not clean and reply.thinking:
+                # Salvage the reasoning instead of throwing ~3 minutes of it away: show its conclusion and ask for the action.
+                state.force_think_off = 1
+                tail = reply.thinking[-CFG.salvage_thinking_chars:]
+                msg = ("ERROR: your reasoning used the whole output budget, so no tool call was made. Here is the END of that "
+                       "reasoning (it is yours; do not redo it):\n<<<\n" + tail + "\n>>>\nThinking is OFF for this reply. Act on "
+                       "that reasoning NOW: write the concrete edit (replace_in_file / write_file) for the most promising idea, and "
+                       "run the check in the same reply. A partial fix that you test beats more analysis.")
+            elif hit_limit or unclosed or not clean:
                 msg = ("ERROR: Your reply was cut off by the output limit before any complete tool call. "
                        "Think less and write smaller files (split large ones), then call your tools.")
             else:
