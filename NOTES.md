@@ -31,6 +31,11 @@ Branch: `worker-improvements` (one commit per change). See HANDOFF.md for the ba
 | Whitespace-tolerant `replace_in_file` (re-indents to fit the file). On a miss it shows the closest region of the file | the model's `<old>` often had the wrong indentation |
 | Exhausted thinking is salvaged: the tail of the reasoning is shown on the next turn with thinking off, and the model is told to act on it | overthinking had wasted about 3 min per turn with no output |
 | Adaptive thinking also thinks on turns 1–2 and during read streaks or the read lock | |
+| **Consult**: when the same check stays the FOCUS for 3 status checks, one call to a dense second model (`qwen3.6-27b`, thinking on) gets the failing check and the recently edited files, and its diagnosis is pinned as advice for 10 turns | tested offline: it found the hardcoded `INTERNAL_H = 540` HUD bug that the 35B had missed for 30 turns (about 10 min per call) |
+| Thinking replies are streamed and cut at 24k chars, then salvaged; the next reply may not read anything (hard lock) | runaway reasoning used to cost about 170 s per turn with no output |
+| A cut-off `write_file` gets a specific message ("nothing was written; edit in small steps or move code into a new module") | |
+| Edited `.py` files are compile-checked immediately | |
+| Small unchanged ranges (60 lines or fewer) are re-shown once instead of refused | |
 | Code map in the task prompt: files, line counts, `def`/`class` lines (protected files marked) | |
 | Live transcript `logs/live_<task>.txt`, written as the run goes and including thinking (tail -f it) | |
 | Orphaned sandbox commands are stopped at startup | |
@@ -46,7 +51,19 @@ Branch: `worker-improvements` (one commit per change). See HANDOFF.md for the ba
 - `workspace/office-game/quick_check.py art|script|live`: runs sections of check_office2.py (art takes 0.25 s). It does not
   change the judge, and the task protects it.
 
+## Task decomposition worked better than one big task
+The local model could not fix the live-input/HUD failures inside a 517-line main.py. It kept overthinking or trying to
+rewrite the whole file. Splitting the work into separate, well-checked tasks helped:
+1. `dev/office_perf_task.txt`: cache the static background and the fonts. **PASSED in 10 turns**: 90 -> 666 fps,
+   pixel-identical screenshots. check_office2.py went from 403 s to 73 s, so every later iteration is about 5x faster.
+2. `dev/office_refactor_task2.txt`: split main.py into input_router/render/hud/game_engine modules. The checker is
+   `refactor_check.py`: no new failures, identical screenshots, sizes. It prints a pixel diff and saves `refactor_diff.png`.
+   The first two runs failed (a stuck loop and an abort); **the third PASSED in 20 turns**.
+3. officeV21: the stage 2 game task again, on the modular code. 16 failing checks remain (8 checks, each failing in
+   script and live mode): live input routing, pause, and HUD layout.
+
 ## Runs
 - minibank: PASSED in 14 turns, 88 s of model time.
-- officeV11–V16: stopped and restarted as the harness changed. V16 fixed the client sprite (gen_extra_assets.py) and
-  the camera.
+- officeV11–V20: stopped and restarted as the harness changed. They fixed the client sprite and the camera.
+- office_perf: PASSED (10 turns). office_refactor3: PASSED (20 turns).
+- `dev/summarize_runs.py` prints one comparison line per run.
