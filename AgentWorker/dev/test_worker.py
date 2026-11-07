@@ -74,6 +74,7 @@ def make_env(test, files, replies, **cfg):
     W.CFG.fix_ownership = False
     W.CFG.ask_turns_left = False
     W.CFG.notes_every = 0
+    W.CFG.think_char_limit = 0          # streaming would bypass the fake model
     for k, v in cfg.items():
         setattr(W.CFG, k, v)
     W.cexec = sb.cexec

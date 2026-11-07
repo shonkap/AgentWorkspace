@@ -96,6 +96,7 @@ class Config:
     model_retries: int = 2
     command_timeout: int = 600            # per command, enforced inside the container
     max_output_chars: int = 8000          # command output shown to the model (head + tail)
+    think_char_limit: int = 24000         # reasoning longer than this (without an answer) is cut off and salvaged (0 = off)
     max_read_chars: int = 24000           # read_file output shown to the model (about 250 lines at once)
     max_history_chars: int = 0            # 0 = derive from num_ctx and num_predict
     max_notes_chars: int = 2500           # pinned summary of trimmed turns
@@ -242,6 +243,7 @@ class TaskState:
     protected: dict = field(default_factory=dict)        # rel path -> original text of files the agent must not change
     reads: dict = field(default_factory=dict)            # rel -> (content hash, set of line numbers shown) still in the history
     protected_lines_read: dict = field(default_factory=dict)   # rel -> lines of a protected file shown so far
+    hard_lock: bool = False                              # this reply may not read at all (set after salvaged reasoning)
     blind_edits: int = 0                                 # consecutive turns that edited files without running anything
     read_locked: bool = False                            # reading is refused until the agent edits or runs something
     iteration: int = 0
@@ -876,6 +878,8 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
     return f"Successfully edited {state.container_dir}/{rel} (1 replacement)"
 
 
+HARD_LOCK_MSG = ("REFUSED: reading is disabled for this reply. You already reasoned about the fix; write it now with "
+                 "replace_in_file or write_file, then run the check.")
 READ_LOCK_MSG = ("REFUSED: re-reading files and list_dir are locked because you have read for many turns without changing "
                  "anything. You already read this file; its contents are above. Make the change you believe is needed NOW (replace_in_file / write_file); "
                  "reading unlocks as soon as you edit a file. If you need one exact line, use run_command with grep -n.")
@@ -965,6 +969,8 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
         covered = set()                     # never read, or changed since: everything is new
     wanted = set(range(start, max(start, req_end) + 1))      # what the model asked for (before widening)
     new_lines = wanted - covered
+    if state.hard_lock:
+        return HARD_LOCK_MSG
     if state.read_locked and len(new_lines) < 0.5 * len(wanted):
         return READ_LOCK_MSG
     if not new_lines:
@@ -997,7 +1003,7 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
 
 def execute_list_dir(state: TaskState, path: str) -> str:
     state.tool_calls += 1
-    if state.read_locked:
+    if state.read_locked or state.hard_lock:
         return READ_LOCK_MSG
     try:
         abs_path, rel = resolve_container_path(state, path or ".", allow_root=True)
@@ -1596,6 +1602,44 @@ def heavy_chat(messages: list[dict], options: dict, think=None):
         raise
 
 
+def streamed_chat(messages: list[dict], options: dict, think=None) -> dict:
+    """Like heavy_chat, but streamed, so that runaway reasoning can be cut off at CFG.think_char_limit characters (the reply
+    then looks like one that hit the output limit, and the caller salvages the reasoning). Returns a plain dict."""
+    kwargs = {"think": think} if (think is not None and CFG.think_supported) else {}
+    stream = heavy_client.chat(model=CFG.heavy_model, messages=messages, options=options,
+                               keep_alive=CFG.heavy_keep_alive, stream=True, **kwargs)
+    thinking, content, last = [], [], None
+    tchars = 0
+    t0 = time.monotonic()
+    cut = False
+    for chunk in stream:
+        last = chunk
+        msg = _field(chunk, "message", None)
+        th = _field(msg, "thinking", "") or ""
+        if th:
+            thinking.append(th)
+            tchars += len(th)
+        c = _field(msg, "content", "") or ""
+        if c:
+            content.append(c)
+        if CFG.think_char_limit and tchars > CFG.think_char_limit and not content:
+            cut = True
+            break
+    if cut:
+        try:
+            stream.close()
+        except Exception:
+            pass
+        print(f"[think] reasoning passed {CFG.think_char_limit} characters without an answer; cut off and salvaged.")
+        return {"message": {"content": "", "thinking": "".join(thinking)}, "done_reason": "length",
+                "prompt_eval_count": 0, "eval_count": tchars // 4, "eval_duration": int((time.monotonic() - t0) * 1e9),
+                "load_duration": 0, "think_cut": True}
+    return {"message": {"content": "".join(content), "thinking": "".join(thinking)},
+            "done_reason": _field(last, "done_reason", ""), "prompt_eval_count": _field(last, "prompt_eval_count", 0),
+            "eval_count": _field(last, "eval_count", 0), "eval_duration": _field(last, "eval_duration", 0),
+            "load_duration": _field(last, "load_duration", 0)}
+
+
 def query_heavy_model(history: list[dict], think=None) -> ModelReply:
     options = {"num_predict": CFG.num_predict, "num_ctx": CFG.num_ctx, "temperature": CFG.temperature}
     last_err = ""
@@ -1603,7 +1647,10 @@ def query_heavy_model(history: list[dict], think=None) -> ModelReply:
     for attempt in range(1, CFG.model_retries + 1):
         try:
             print(f"[*] Querying {CFG.heavy_model} (Attempt {attempt}/{CFG.model_retries})...")
-            res = heavy_chat(history, options, think)
+            if CFG.think_char_limit and think not in (None, False) and CFG.think_supported:
+                res = streamed_chat(history, options, think)
+            else:
+                res = heavy_chat(history, options, think)
             msg = res["message"]
             return ModelReply(
                 content=msg["content"] or "",
@@ -1954,6 +2001,19 @@ def source_snippets(state: TaskState, failure: str, limit: int = 2) -> str:
     return "\n".join(blocks)
 
 
+def pick_focus(pairs: list) -> tuple:
+    """The check to work on next: a crash first (nothing else can pass), then 'add X' failures (something simply
+    missing: quick wins that build momentum), then the rest in the checker's order."""
+    def rank(p):
+        n, r = p
+        if "runs without crashing" in n or re.search(r"\b\w*Error\b|Traceback", r):
+            return 0
+        if re.match(r"\s*(add|missing)\b", r, re.IGNORECASE):
+            return 1
+        return 2
+    return min(pairs, key=rank)
+
+
 def build_status_block(state: TaskState) -> str:
     pairs = state.status_pairs
     reasons = [f"{n} -> {r[:300 if k < 3 else 140]}" for k, (n, r) in enumerate(pairs[:8])]
@@ -1961,7 +2021,7 @@ def build_status_block(state: TaskState) -> str:
     fixed = (f"\nNow PASSING in a later quick check (fixed since): " + "; ".join(state.status_fixed[:6])) if state.status_fixed else ""
     focus = ""
     if pairs:
-        n0, r0 = pairs[0]
+        n0, r0 = pick_focus(pairs)
         focus = (f"\nFOCUS NOW: fix exactly this one check in your next reply, then rerun the checks: `{n0}` -> {r0[:400]}\n"
                  "Find the code responsible (you have read it), change it with replace_in_file, and run the check in the same reply.")
     return (f"AUTHORITATIVE STATUS (acceptance checks run by the harness at turn {state.status_turn}; this is newer and more reliable "
@@ -2219,9 +2279,10 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             if hit_limit and not clean and reply.thinking:
                 # Salvage the reasoning instead of throwing ~3 minutes of it away: show its conclusion and ask for the action.
                 state.force_think_off = 1
+                state.hard_lock = True
                 tail = reply.thinking[-CFG.salvage_thinking_chars:]
                 msg = ("ERROR: your reasoning used the whole output budget, so no tool call was made. Here is the END of that "
-                       "reasoning (it is yours; do not redo it):\n<<<\n" + tail + "\n>>>\nThinking is OFF for this reply. Act on "
+                       "reasoning (it is yours; do not redo it):\n<<<\n" + tail + "\n>>>\nThinking is OFF for this reply and reading is DISABLED for it (read_file/list_dir will be refused). Act on "
                        "that reasoning NOW: write the concrete edit (replace_in_file / write_file) for the most promising idea, and "
                        "run the check in the same reply. A partial fix that you test beats more analysis.")
             elif hit_limit or unclosed or not clean:
@@ -2286,6 +2347,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             if done:
                 transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
                 return True, done
+        state.hard_lock = False
         if any(kind in ("write_file", "replace_in_file") for kind, _ in calls):
             state.readonly_streak = 0
             state.read_locked = False
