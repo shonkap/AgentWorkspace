@@ -1,8 +1,10 @@
 WORKDIR: office-game
 REQUIRE: perf_check.py
 REQUIRE: ref_shot.png
+REQUIRE: ref_shot_walk.png
 PROTECT: perf_check.py
 PROTECT: ref_shot.png
+PROTECT: ref_shot_walk.png
 PROTECT: check_office2.py
 PROTECT: quick_check.py
 PROTECT: economy_ref.py
@@ -20,11 +22,12 @@ Make it fast WITHOUT changing what is drawn:
    pygame.Surface of the whole 800x520 world, and blit the visible part of that surface each frame.
  - Create each pygame.font.Font once (cache by size) instead of on every call.
  - Keep one full repaint and exactly one display flip per frame; keep the --script and live paths identical.
- - The picture must stay pixel-identical: `python3 tamagotchi/main.py --frames 30 --screenshot /tmp/now.png` must
-   produce exactly the same image as the protected ref_shot.png (the VERIFY command below compares them).
+ - The picture must stay pixel-identical, also when the camera has moved: the VERIFY commands below compare
+   `--frames 30` with the protected ref_shot.png and `--script right:40,down:30 --frames 90` with ref_shot_walk.png.
 Goal: `python3 perf_check.py` passes (600 frames in at most 2.5 s). Run it, and the image comparison, after each change.
 
 VERIFY: python3 perf_check.py
 VERIFY: python3 tamagotchi/main.py --frames 30 --screenshot /tmp/now.png && python3 -c "from PIL import Image, ImageChops; import sys; d = ImageChops.difference(Image.open('/tmp/now.png').convert('RGB'), Image.open('ref_shot.png').convert('RGB')).getbbox(); print('PASS  screenshot identical to ref_shot.png' if d is None else f'FAIL  screenshot differs from ref_shot.png  ->  differing box {d}'); sys.exit(d is not None)"
+VERIFY: python3 tamagotchi/main.py --script right:40,down:30 --frames 90 --screenshot /tmp/now2.png && python3 -c "from PIL import Image, ImageChops; import sys; d = ImageChops.difference(Image.open('/tmp/now2.png').convert('RGB'), Image.open('ref_shot_walk.png').convert('RGB')).getbbox(); print('PASS  screenshot identical to ref_shot_walk.png' if d is None else f'FAIL  screenshot differs from ref_shot_walk.png  ->  differing box {d}'); sys.exit(d is not None)"
 VERIFY: python3 quick_check.py art
 VERIFY: python3 -m unittest discover -s tamagotchi -p "test_*.py"
