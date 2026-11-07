@@ -94,7 +94,7 @@ class Config:
     model_retries: int = 2
     command_timeout: int = 600            # per command, enforced inside the container
     max_output_chars: int = 8000          # command output shown to the model (head + tail)
-    max_read_chars: int = 16000           # read_file output shown to the model (about 250 lines at once)
+    max_read_chars: int = 24000           # read_file output shown to the model (about 250 lines at once)
     max_history_chars: int = 0            # 0 = derive from num_ctx and num_predict
     max_notes_chars: int = 2500           # pinned summary of trimmed turns
 
@@ -844,14 +844,15 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
 
     all_lines = text.splitlines()
     start, end = 1, max(len(all_lines), 1)
+    req_end = end
     if lines_spec:
         m = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", lines_spec)
         if not m:
             return f"Failed to read file: lines must look like lines=\"10-50\", got {lines_spec!r}."
         start, end = max(int(m.group(1)), 1), min(int(m.group(2)), len(all_lines))
+        req_end = end
         if CFG.min_read_lines and end - start + 1 < CFG.min_read_lines:
-            # small chunks cost one turn each: widen the window (some context above, more below)
-            start = max(1, start - 20)
+            # small chunks cost one turn each: widen the window forward (the start stays where the model asked)
             end = min(len(all_lines), start + CFG.min_read_lines - 1)
     if end < start:
         return f"Failed to read file: {rel} has only {len(all_lines)} lines."
@@ -860,7 +861,7 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
     seen_digest, covered = state.reads.get(rel, (None, set()))
     if seen_digest != digest:
         covered = set()                     # never read, or changed since: everything is new
-    wanted = set(range(start, end + 1))
+    wanted = set(range(start, max(start, req_end) + 1))      # what the model asked for (before widening)
     new_lines = wanted - covered
     if state.read_locked and len(new_lines) < 0.5 * len(wanted):
         return READ_LOCK_MSG
