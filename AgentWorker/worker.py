@@ -1441,6 +1441,7 @@ def summarize_dropped(dropped: list[dict], notes: str, state: Optional[TaskState
 class ModelReply:
     content: Optional[str]                 # None = persistent failure
     thinking_chars: int = 0                # reasoning returned in the separate `thinking` field
+    thinking: str = ""
     hit_limit: bool = False
     done_reason: str = ""
     prompt_tokens: int = 0
@@ -1502,6 +1503,7 @@ def query_heavy_model(history: list[dict], think=None) -> ModelReply:
             return ModelReply(
                 content=msg["content"] or "",
                 thinking_chars=len(_field(msg, "thinking", "") or ""),
+                thinking=str(_field(msg, "thinking", "") or ""),
                 hit_limit=_field(res, "done_reason", "") == "length",
                 done_reason=str(_field(res, "done_reason", "") or ""),
                 prompt_tokens=int(_field(res, "prompt_eval_count", 0) or 0),
@@ -1878,8 +1880,14 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
     if len(last3) == 3 and names and last3[0] == last3[1] == last3[2]:
         stuck = (f"The same {len(names)} check(s) have failed at the last 3 status checks (about {3 * CFG.status_every} turns). Your current approach "
                  "is not working. Stop reading and theorizing: run the failing thing, read its first error line, and change code.")
+    focus = ""
+    if pairs:
+        n0, r0 = pairs[0]
+        focus = (f"\nFOCUS NOW: fix exactly this one check in your next reply, then rerun the checks: `{n0}` -> {r0[:400]}\n"
+                 "Find the code responsible (you have read it), change it with replace_in_file, and run the check in the same reply.")
     state.status_block = (f"AUTHORITATIVE STATUS (acceptance checks run by the harness at turn {iteration}; this is newer and more reliable than "
-                          f"anything you remember or wrote in older notes):\n{body}" + ("\n" + "\n".join(extra) if extra else "") + (f"\n{stuck}" if stuck else ""))
+                          f"anything you remember or wrote in older notes):\n{body}" + ("\n" + "\n".join(extra) if extra else "") + (f"\n{stuck}" if stuck else "")
+                          + focus)
     state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + (plateau or "")
     log_to_transcript(state, f"=== Status check at turn {iteration} ===\n{state.status_block}")
     state.events.emit("status_check", turn=iteration, failing=len(reasons))
@@ -2016,6 +2024,10 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         record_turn_stats(state, reply, think_chars, model_seconds, think)
 
         print(f"\n[Model Response]:\n{response}")
+        if reply.thinking:
+            th = reply.thinking
+            th = th if len(th) <= 2500 else th[:1200] + "\n[...]\n" + th[-1200:]
+            transcript.append(f"=== Turn {iteration}: model thinking ({len(reply.thinking)} chars) ===\n{th}")
         transcript.append(f"=== Turn {iteration}: model ===\n{response}")
 
         # Only the cleaned text is parsed and stored: tool tags inside <think> must never
@@ -2115,7 +2127,16 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs))
             return False, f"Stuck: the same action produced the same result {worst} times."
 
-        if (CFG.status_every and state.verify_cmds and iteration - state.last_status_turn >= CFG.status_every and not wants_complete
+        ran_check = any(k == "run_command" and fix_command_paths(a["cmd"]).strip() in [fix_command_paths(v).strip() for v in state.verify_cmds]
+                        for k, a in calls)
+        if ran_check and not wants_complete and state.verify_cmds and checks_cheap_or_cached(state):
+            # the model just ran a check unfiltered: refresh the pinned status from it (cached, so nearly free)
+            state.status_version = workdir_fingerprint(state)
+            done = periodic_status(state, iteration)
+            if done:
+                transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
+                return True, done
+        elif (CFG.status_every and state.verify_cmds and iteration - state.last_status_turn >= CFG.status_every and not wants_complete
                 and workdir_fingerprint(state) != state.status_version):
             state.status_version = workdir_fingerprint(state)
             done = periodic_status(state, iteration)
