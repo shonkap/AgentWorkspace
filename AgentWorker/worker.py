@@ -215,6 +215,7 @@ class TaskState:
     tool_calls: int = 0
     unverified_changes: bool = False   # files changed since the last successful command
     verify_cmds: list = field(default_factory=list)
+    quick_cmds: list = field(default_factory=list)
     verify_failures: int = 0
     notes: str = ""                    # summary of trimmed history, pinned in the task prompt
     base_prompt: str = ""
@@ -308,13 +309,19 @@ def parse_task_file(text: str) -> tuple[str, list[str], Optional[str]]:
     verify = [m.group(1).strip() for m in re.finditer(r"^\s*VERIFY:\s*(.+?)\s*$", text, re.IGNORECASE | re.MULTILINE)]
     m = re.search(r"^\s*WORKDIR:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)
     workdir = os.path.basename(m.group(1).rstrip("/")) if m else None
-    goal = re.sub(r"^\s*(?:VERIFY|WORKDIR|REQUIRE|PROTECT):.*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+    goal = re.sub(r"^\s*(?:VERIFY|WORKDIR|REQUIRE|PROTECT|QUICKCHECK):.*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
     return goal, [v for v in verify if v], workdir
 
 
 def parse_required_files(text: str) -> list[str]:
     """`REQUIRE: some_file.py` lines name files that must already exist in the working directory."""
     return [m.group(1) for m in re.finditer(r"^\s*REQUIRE:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)]
+
+
+def parse_quick_checks(text: str) -> list[str]:
+    """`QUICKCHECK: cmd` lines: fast partial checks the harness runs itself after every turn that edited files without
+    running anything, so the model sees the effect of each edit within seconds. VERIFY stays the judge."""
+    return [m.group(1).strip() for m in re.finditer(r"^\s*QUICKCHECK:\s*(.+?)\s*$", text, re.IGNORECASE | re.MULTILINE)]
 
 
 def parse_protected_files(text: str) -> list[str]:
@@ -1278,6 +1285,9 @@ def build_task_prompt(state: TaskState, goal: str) -> str:
         checks = "\n".join(f"- {c}" for c in state.verify_cmds)
         parts.append("Acceptance checks (run automatically by the harness when you declare completion; "
                      f"you may run them yourself first, from {state.container_dir}):\n{checks}")
+    if state.quick_cmds:
+        parts.append("QUICK checks (fast partial checks; the harness also runs them for you after every reply that edits files "
+                     "without running anything):\n" + "\n".join(f"- {c}" for c in state.quick_cmds))
     if state.protected:
         parts.append("PROTECTED files (read and run them, never change them; the harness refuses edits and restores them): "
                      + ", ".join(sorted(state.protected)))
@@ -1668,6 +1678,7 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
         state.events.emit("task_start_refused", missing=missing)
         return False, reason, transcript
     state.verify_cmds = verify_cmds
+    state.quick_cmds = parse_quick_checks(raw)
     unreadable = snapshot_protected(state, parse_protected_files(raw))
     if unreadable:
         reason = f"Protected file(s) missing from {state.container_dir}: {', '.join(unreadable)}."
@@ -2188,6 +2199,15 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         edited = any(k in ("write_file", "replace_in_file") for k, _ in calls)
         ran = any(k == "run_command" for k, _ in calls)
         state.blind_edits = state.blind_edits + 1 if (edited and not ran) else (0 if ran else state.blind_edits)
+        if edited and not ran and state.quick_cmds and not wants_complete:
+            for qc in state.quick_cmds:
+                code, out = container_exec(state, fix_command_paths(qc), timeout=180)
+                state.events.emit("quick_check", turn=iteration, cmd=qc, exit_code=code)
+                notes.append(f"QUICK CHECK run by the harness after your edit: {qc}\nExit Code: {code}\n"
+                             + truncate_output(compress_output(out), 4000))
+                if code != 0:
+                    break
+            state.blind_edits = 0          # the quick checks were the feedback
         cheap = sum(state.verify_seconds.get(fix_command_paths(v).strip(), 9999) for v in state.verify_cmds) <= CFG.auto_verify_seconds
         if (CFG.auto_verify_seconds and edited and not ran and state.verify_cmds and not wants_complete
                 and (cheap or state.blind_edits >= CFG.blind_edit_limit)):

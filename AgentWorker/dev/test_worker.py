@@ -199,6 +199,14 @@ class Tests(unittest.TestCase):
         self.assertNotIn("line201", r[4])
         self.assertIn("REFUSED", r[5])
 
+    def test_quick_check_after_edit(self):
+        sb, model = make_env(self, {"check.py": CHECK}, ['<write_file path="val.txt">7</write_file>', "<list_dir/>"],
+                             max_iterations=2, status_every=0, initial_status=False, auto_verify_seconds=0)
+        W.run_task(task_file(sb, "WORKDIR: proj\nx\nQUICKCHECK: cat val.txt\nVERIFY: python3 check.py"), 1)
+        self.assertIn("QUICK checks", model.seen[0][1]["content"])
+        self.assertIn("QUICK CHECK run by the harness after your edit: cat val.txt\nExit Code: 0\n7", model.seen[1][-1]["content"])
+        self.assertNotIn("QUICKCHECK", model.seen[0][1]["content"])
+
     def test_initial_status_and_code_map(self):
         sb, model = make_env(self, {"check.py": CHECK, "lib.py": "class Foo:\n    def bar(self):\n        pass\n"},
                              ["<list_dir/>"], max_iterations=1, status_every=0)
