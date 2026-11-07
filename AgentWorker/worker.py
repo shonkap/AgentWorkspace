@@ -807,6 +807,20 @@ def resolve_container_path(state: TaskState, path: str, *, allow_root: bool = Fa
     return f"{root}/{norm}", norm
 
 
+def syntax_note(abs_path: str, rel: str) -> str:
+    """Compile an edited Python file right away, so a broken edit is reported in the same turn, not minutes later."""
+    if not rel.endswith(".py"):
+        return ""
+    try:
+        code, out = cexec(["python3", "-c", "import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])", abs_path], timeout=30)
+    except Exception:
+        return ""
+    if code == 0:
+        return ""
+    lines = [l for l in out.strip().splitlines() if l.strip()]
+    return ("\nWARNING: the file no longer compiles. Fix this first:\n" + "\n".join(lines[-4:]))
+
+
 def execute_write_file(state: TaskState, path: str, content: str) -> str:
     state.tool_calls += 1
     try:
@@ -832,7 +846,7 @@ def execute_write_file(state: TaskState, path: str, content: str) -> str:
     state.unverified_changes = True
     if not text.strip() and posixpath.basename(abs_path) not in EMPTY_FILE_OK:
         return f"ERROR: {state.container_dir}/{rel} was written empty. Provide the file contents."
-    return f"Successfully wrote {len(text)} characters to {state.container_dir}/{rel}"
+    return f"Successfully wrote {len(text)} characters to {state.container_dir}/{rel}" + syntax_note(abs_path, rel)
 
 
 def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> str:
@@ -866,7 +880,7 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
             return f"Failed to edit file: {err}"
         state.unverified_changes = True
         return (f"Successfully edited {state.container_dir}/{rel} (1 replacement at line {where}; <old> matched only when "
-                "ignoring indentation, so the indentation of the file was kept)")
+                "ignoring indentation, so the indentation of the file was kept)" + syntax_note(abs_path, rel))
     if count > 1:
         return f"Failed to edit {rel}: <old> matches {count} places. Include more surrounding lines so it matches exactly once."
 
@@ -875,7 +889,7 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
     if err:
         return f"Failed to edit file: {err}"
     state.unverified_changes = True
-    return f"Successfully edited {state.container_dir}/{rel} (1 replacement)"
+    return f"Successfully edited {state.container_dir}/{rel} (1 replacement)" + syntax_note(abs_path, rel)
 
 
 HARD_LOCK_MSG = ("REFUSED: reading is disabled for this reply. You already reasoned about the fix; write it now with "

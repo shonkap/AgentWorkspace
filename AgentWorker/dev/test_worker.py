@@ -226,6 +226,13 @@ class Tests(unittest.TestCase):
         self.assertIn("FOCUS NOW: fix exactly this one check in your next reply, then rerun the checks: `val is 42`", second)
         self.assertIn("Now PASSING in a later quick check (fixed since): val exists", second)
 
+    def test_syntax_note(self):
+        sb, model = make_env(self, {"check.py": CHECK, "m.py": "x = 1\n"},
+                             ['<replace_in_file path="m.py"><old>x = 1</old><new>x = (1</new></replace_in_file>', "<list_dir/>"],
+                             max_iterations=2, status_every=0, initial_status=False)
+        W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
+        self.assertIn("WARNING: the file no longer compiles", model.seen[1][-1]["content"])
+
     def test_initial_status_and_code_map(self):
         sb, model = make_env(self, {"check.py": CHECK, "lib.py": "class Foo:\n    def bar(self):\n        pass\n"},
                              ["<list_dir/>"], max_iterations=1, status_every=0)
