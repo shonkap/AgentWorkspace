@@ -2064,7 +2064,8 @@ def consult(state: TaskState, iteration: int, focus: tuple) -> None:
     name, reason = focus
     files = []
     budget = 30000
-    for rel in reversed(state.recent_edits):
+    candidates = list(reversed(state.recent_edits)) + [r for r in reversed(list(state.reads)) if r not in state.recent_edits]
+    for rel in candidates[:6]:
         text, _ = container_read(posixpath.join(state.container_dir, rel))
         if text is None or rel in state.protected:
             continue
@@ -2077,7 +2078,9 @@ def consult(state: TaskState, iteration: int, focus: tuple) -> None:
         return
     prompt = (f"A coding agent keeps failing this acceptance check:\n  {name} -> {reason[:1500]}\n\nTask (start): "
               f"{state.base_prompt[:1200]}\n\nThe files it has been editing:\n" + "\n\n".join(files) +
-              "\n\nFind the most likely cause of THIS failure in the code above. Answer in at most 6 lines: the file and line, "
+              "\n\nFind the most likely cause of THIS failure in the code above. Consider that the failure message may be "
+              "computed from values the program reports (for example a counter in a state dump) rather than from the behavior "
+              "itself. Answer in at most 6 lines: the file and line, "
               "what is wrong, and the exact change to make. No other text.")
     print(f"[consult] asking {CFG.consult_model} about: {name}")
     t0 = time.monotonic()
