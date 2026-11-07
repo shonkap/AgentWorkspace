@@ -155,14 +155,14 @@ class Tests(unittest.TestCase):
 
     def test_read_dedup_and_lock(self):
         sb, model = make_env(self, {"check.py": CHECK, "a.py": "x = 1\n"},
-                             ['<read_file path="a.py"/>'] * 4 + ['<run_command>true</run_command>', '<read_file path="a.py"/>'],
-                             max_iterations=6, status_every=0, readonly_nudge=3)
+                             ['<read_file path="a.py"/>'] * 4 + ['<run_command>true</run_command>', '<read_file path="a.py"/>', '<write_file path="b.txt">1</write_file>', '<read_file path="a.py"/>'],
+                             max_iterations=8, status_every=0, readonly_nudge=3)
         W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
         self.assertIn("x = 1", model.seen[1][-1]["content"])
         self.assertIn("UNCHANGED", model.seen[2][-1]["content"])
         self.assertIn("LOCKED", model.seen[3][-1]["content"])
-        self.assertIn("REFUSED: reading is locked", model.seen[4][-1]["content"])
-        self.assertIn("UNCHANGED", model.seen[6][-1]["content"] if len(model.seen) > 6 else "UNCHANGED")
+        self.assertIn("REFUSED: read_file/list_dir are locked", model.seen[4][-1]["content"])
+        self.assertIn("REFUSED: read_file/list_dir are locked", model.seen[6][-1]["content"])   # a command does not unlock
 
     def test_status_uses_cache(self):
         sb, model = make_env(self, {"check.py": CHECK}, ["<run_command>python3 check.py</run_command>"] + ["<list_dir/>"] * 5,

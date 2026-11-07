@@ -794,9 +794,9 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
     return f"Successfully edited {state.container_dir}/{rel} (1 replacement)"
 
 
-READ_LOCK_MSG = ("REFUSED: reading is locked because you have only read files for many turns. You already have enough "
-                 "information. This turn you MUST change something (write_file / replace_in_file) or run a command "
-                 "(for example an acceptance check). Reading unlocks as soon as you do.")
+READ_LOCK_MSG = ("REFUSED: read_file/list_dir are locked because you have read for many turns without changing anything. You "
+                 "already have enough information. Make the change you believe is needed NOW (replace_in_file / write_file); "
+                 "reading unlocks as soon as you edit a file. If you need one exact line, use run_command with grep -n.")
 
 
 def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) -> str:
@@ -2024,19 +2024,21 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             if done:
                 transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
                 return True, done
-        if all(kind in ("read_file", "list_dir", "view_image", "search_web") for kind, _ in calls):
-            state.readonly_streak += 1
-        else:
+        if any(kind in ("write_file", "replace_in_file") for kind, _ in calls):
             state.readonly_streak = 0
             state.read_locked = False
+        elif all(kind in ("read_file", "list_dir", "view_image", "search_web") for kind, _ in calls):
+            state.readonly_streak += 1
+        elif not state.read_locked:
+            state.readonly_streak = max(0, state.readonly_streak - 2)   # running something helps, but only an edit unlocks
         if state.readonly_streak >= CFG.readonly_nudge and not state.read_locked:
             state.read_locked = True
             state.last_readonly_nudge = iteration
             state.events.emit("readonly_nudge", turn=iteration, streak=state.readonly_streak)
             first = state.verify_cmds[0] if state.verify_cmds else "your program or its tests"
-            text = (f"NUDGE: you have only READ for {state.readonly_streak} turns in a row (no edit, no command). Reading is now LOCKED "
-                    "until you edit a file or run a command. Make the change you already know is needed, or run "
-                    f"`{first}` and fix the FIRST failure it reports.")
+            text = (f"NUDGE: you have read for {state.readonly_streak} turns without changing any file. read_file/list_dir are now LOCKED "
+                    "until you edit a file. Make the change you already know is needed for the FIRST failing check "
+                    f"(`{first}` shows them), using replace_in_file, and rerun the check in the same reply.")
             log_to_transcript(state, f"=== Read-only lock at turn {iteration} ===\n{text}")
             state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + text
         notes = list(nudges)
