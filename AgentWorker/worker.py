@@ -85,6 +85,9 @@ class Config:
     code_map: bool = True                 # existing project: show a file/definition outline in the task prompt
     protected_read_lines: int = 200       # read_file shows at most this many lines of each PROTECTED file per task
     salvage_thinking_chars: int = 3000    # when thinking eats the whole reply budget, show the model this much of its tail
+    consult_model: str = "qwen3.6-27b-uncensored:latest"   # second opinion when stuck on one check ("" = off)
+    consult_after: int = 3                # the same FOCUS check at this many status checks in a row triggers a consult
+    consult_turns: int = 10               # the advice stays pinned for this many turns
     blind_edit_limit: int = 3             # after this many edit-only turns in a row, the harness runs the checks even if slow
     min_read_lines: int = 150             # read_file ranges smaller than this are widened (0 = off)
     readonly_nudge: int = 8               # this many turns of ONLY reading (no command, no edit) triggers a 'run something' nudge
@@ -244,6 +247,11 @@ class TaskState:
     reads: dict = field(default_factory=dict)            # rel -> (content hash, set of line numbers shown) still in the history
     protected_lines_read: dict = field(default_factory=dict)
     reshown: set = field(default_factory=set)            # small unchanged ranges already shown a second time   # rel -> lines of a protected file shown so far
+    recent_edits: list = field(default_factory=list)     # rel paths edited, newest last
+    focus_history: list = field(default_factory=list)    # FOCUS check name at each status check
+    consulted: set = field(default_factory=set)          # FOCUS checks a consult was already asked about
+    advice: str = ""
+    advice_until: int = 0
     hard_lock: bool = False                              # this reply may not read at all (set after salvaged reasoning)
     blind_edits: int = 0                                 # consecutive turns that edited files without running anything
     read_locked: bool = False                            # reading is refused until the agent edits or runs something
@@ -808,6 +816,13 @@ def resolve_container_path(state: TaskState, path: str, *, allow_root: bool = Fa
     return f"{root}/{norm}", norm
 
 
+def note_edit(state: "TaskState", rel: str) -> None:
+    if rel in state.recent_edits:
+        state.recent_edits.remove(rel)
+    state.recent_edits.append(rel)
+    del state.recent_edits[:-6]
+
+
 def syntax_note(abs_path: str, rel: str) -> str:
     """Compile an edited Python file right away, so a broken edit is reported in the same turn, not minutes later."""
     if not rel.endswith(".py"):
@@ -845,6 +860,7 @@ def execute_write_file(state: TaskState, path: str, content: str) -> str:
         return f"Failed to write file: {err}"
 
     state.unverified_changes = True
+    note_edit(state, rel)
     if not text.strip() and posixpath.basename(abs_path) not in EMPTY_FILE_OK:
         return f"ERROR: {state.container_dir}/{rel} was written empty. Provide the file contents."
     return f"Successfully wrote {len(text)} characters to {state.container_dir}/{rel}" + syntax_note(abs_path, rel)
@@ -880,6 +896,7 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
         if err:
             return f"Failed to edit file: {err}"
         state.unverified_changes = True
+        note_edit(state, rel)
         return (f"Successfully edited {state.container_dir}/{rel} (1 replacement at line {where}; <old> matched only when "
                 "ignoring indentation, so the indentation of the file was kept)" + syntax_note(abs_path, rel))
     if count > 1:
@@ -890,6 +907,7 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
     if err:
         return f"Failed to edit file: {err}"
     state.unverified_changes = True
+    note_edit(state, rel)
     return f"Successfully edited {state.container_dir}/{rel} (1 replacement)" + syntax_note(abs_path, rel)
 
 
@@ -1969,6 +1987,8 @@ def render_kept_notes(state: TaskState) -> str:
         parts.append("LEARNED so far (kept even when old turns are trimmed):\n" + "\n".join(f"- {x}" for x in state.learned[-25:]))
     if state.plan:
         parts.append(f"YOUR LATEST PLAN: {state.plan}")
+    if state.advice and state.iteration <= state.advice_until:
+        parts.append(state.advice)
     return "\n".join(parts)
 
 
@@ -2038,6 +2058,47 @@ def pick_focus(pairs: list) -> tuple:
     return min(pairs, key=rank)
 
 
+def consult(state: TaskState, iteration: int, focus: tuple) -> None:
+    """The main model has failed the same check for a long time. Ask a different (dense) model once for a diagnosis, with
+    the failing check and the files that were edited recently, and pin its answer as advice for a few turns."""
+    name, reason = focus
+    files = []
+    budget = 30000
+    for rel in reversed(state.recent_edits):
+        text, _ = container_read(posixpath.join(state.container_dir, rel))
+        if text is None or rel in state.protected:
+            continue
+        numbered = "\n".join(f"{i:>4} | {l}" for i, l in enumerate(text.splitlines(), 1))
+        if len(numbered) > budget:
+            continue
+        budget -= len(numbered)
+        files.append(f"=== {rel} ===\n{numbered}")
+    if not files:
+        return
+    prompt = (f"A coding agent keeps failing this acceptance check:\n  {name} -> {reason[:1500]}\n\nTask (start): "
+              f"{state.base_prompt[:1200]}\n\nThe files it has been editing:\n" + "\n\n".join(files) +
+              "\n\nFind the most likely cause of THIS failure in the code above. Answer in at most 6 lines: the file and line, "
+              "what is wrong, and the exact change to make. No other text.")
+    print(f"[consult] asking {CFG.consult_model} about: {name}")
+    t0 = time.monotonic()
+    try:
+        res = heavy_client.chat(model=CFG.consult_model, messages=[{"role": "user", "content": prompt}],
+                                options={"num_ctx": 32768, "num_predict": 10000, "temperature": 0.3},
+                                keep_alive="5m", think=True)
+        answer = strip_thinking(_field(_field(res, "message", {}), "content", "") or "").strip()
+    except Exception as e:
+        print(f"[consult] failed: {e}")
+        state.events.emit("consult_failed", error=str(e)[:200])
+        return
+    if not answer:
+        return
+    state.advice = (f"ADVICE from a second reviewer about `{name}` (it read your recent files; verify it against the code before "
+                    f"acting on it):\n{answer[:1200]}")
+    state.advice_until = iteration + CFG.consult_turns
+    state.events.emit("consult", turn=iteration, check=name, seconds=round(time.monotonic() - t0, 1), answer=answer[:300])
+    log_to_transcript(state, f"=== Consult at turn {iteration} ({CFG.consult_model}) ===\n{answer}")
+
+
 def build_status_block(state: TaskState) -> str:
     pairs = state.status_pairs
     reasons = [f"{n} -> {r[:300 if k < 3 else 140]}" for k, (n, r) in enumerate(pairs[:8])]
@@ -2103,6 +2164,13 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
         stuck = (f"The same {len(names)} check(s) have failed at the last 3 status checks (about {3 * CFG.status_every} turns). Your current approach "
                  "is not working. Stop reading and theorizing: run the failing thing, read its first error line, and change code.")
     state.status_pairs, state.status_turn = pairs, iteration
+    if pairs:
+        fname = pick_focus(pairs)[0]
+        state.focus_history.append(fname)
+        recent = state.focus_history[-CFG.consult_after:]
+        if (CFG.consult_model and len(recent) == CFG.consult_after and len(set(recent)) == 1 and fname not in state.consulted):
+            state.consulted.add(fname)
+            consult(state, iteration, pick_focus(pairs))
     state.status_extra = extra + ([stuck] if stuck else [])
     state.status_fixed = []
     state.status_block = build_status_block(state) if pairs else (
