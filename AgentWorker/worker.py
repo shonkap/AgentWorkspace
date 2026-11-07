@@ -86,7 +86,7 @@ class Config:
     protected_read_lines: int = 200       # read_file shows at most this many lines of each PROTECTED file per task
     salvage_thinking_chars: int = 3000    # when thinking eats the whole reply budget, show the model this much of its tail
     consult_model: str = "qwen3.6-27b-uncensored:latest"   # second opinion when stuck on one check ("" = off)
-    consult_after: int = 3                # the same FOCUS check at this many status checks in a row triggers a consult
+    consult_after: int = 20               # the same FOCUS check for this many turns triggers a consult
     consult_turns: int = 10               # the advice stays pinned for this many turns
     blind_edit_limit: int = 3             # after this many edit-only turns in a row, the harness runs the checks even if slow
     min_read_lines: int = 150             # read_file ranges smaller than this are widened (0 = off)
@@ -248,7 +248,7 @@ class TaskState:
     protected_lines_read: dict = field(default_factory=dict)
     reshown: set = field(default_factory=set)            # small unchanged ranges already shown a second time   # rel -> lines of a protected file shown so far
     recent_edits: list = field(default_factory=list)     # rel paths edited, newest last
-    focus_history: list = field(default_factory=list)    # FOCUS check name at each status check
+    focus_since: tuple = ()                              # (FOCUS check name, turn it became the focus)
     consulted: set = field(default_factory=set)          # FOCUS checks a consult was already asked about
     advice: str = ""
     advice_until: int = 0
@@ -2169,11 +2169,8 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
     state.status_pairs, state.status_turn = pairs, iteration
     if pairs:
         fname = pick_focus(pairs)[0]
-        state.focus_history.append(fname)
-        recent = state.focus_history[-CFG.consult_after:]
-        if (CFG.consult_model and len(recent) == CFG.consult_after and len(set(recent)) == 1 and fname not in state.consulted):
-            state.consulted.add(fname)
-            consult(state, iteration, pick_focus(pairs))
+        if not state.focus_since or state.focus_since[0] != fname:
+            state.focus_since = (fname, iteration)
     state.status_extra = extra + ([stuck] if stuck else [])
     state.status_fixed = []
     state.status_block = build_status_block(state) if pairs else (
@@ -2283,6 +2280,12 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
                 transcript.append(f"=== Auto-complete ===\n{done}")
                 return True, done
 
+        if (CFG.consult_model and state.focus_since and state.status_pairs
+                and iteration - state.focus_since[1] >= CFG.consult_after and state.focus_since[0] not in state.consulted):
+            focus = next((p for p in state.status_pairs if p[0] == state.focus_since[0]), None)
+            if focus:
+                state.consulted.add(focus[0])
+                consult(state, iteration, focus)
         dropped = trim_history(history)
         if dropped:
             state.reads.clear()          # the trimmed turns held those file contents: re-reading is legitimate again

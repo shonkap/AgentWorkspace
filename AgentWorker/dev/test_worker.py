@@ -240,6 +240,17 @@ class Tests(unittest.TestCase):
         W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
         self.assertIn("write_file of big.py was cut off", model.seen[1][-1]["content"])
 
+    def test_consult_when_stuck(self):
+        sb, model = make_env(self, {"check.py": CHECK, "a.py": "x = 1\n"}, ['<read_file path="a.py"/>'] + ["<list_dir/>"] * 4,
+                             max_iterations=4, status_every=0, consult_model="fake27b", consult_after=2)
+        asked = []
+        W.heavy_client = type("H", (), {"chat": staticmethod(lambda **kw: asked.append(kw) or
+                                                              {"message": {"content": "a.py line 1: write val.txt"}})})()
+        W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
+        self.assertEqual(len(asked), 1)
+        self.assertIn("x = 1", asked[0]["messages"][0]["content"])
+        self.assertIn("ADVICE from a second reviewer", model.seen[-1][-1]["content"])
+
     def test_initial_status_and_code_map(self):
         sb, model = make_env(self, {"check.py": CHECK, "lib.py": "class Foo:\n    def bar(self):\n        pass\n"},
                              ["<list_dir/>"], max_iterations=1, status_every=0)
