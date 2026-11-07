@@ -2306,6 +2306,12 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
                        "reasoning (it is yours; do not redo it):\n<<<\n" + tail + "\n>>>\nThinking is OFF for this reply and reading is DISABLED for it (read_file/list_dir will be refused). Act on "
                        "that reasoning NOW: write the concrete edit (replace_in_file / write_file) for the most promising idea, and "
                        "run the check in the same reply. A partial fix that you test beats more analysis.")
+            elif (m := re.search(r"<write_file\s+path=[\"']([^\"']+)[\"']\s*>(.*)\Z", clean, re.DOTALL)) and "</write_file>" not in m.group(2):
+                n = m.group(2).count("\n")
+                msg = (f"ERROR: your write_file of {m.group(1)} was cut off by the output limit after about {n} lines, so NOTHING was "
+                       "written (the file is unchanged). Never rewrite a large file in one reply. Instead: change it with several "
+                       "small replace_in_file edits, or move one part of it (for example the input handling or the drawing code) "
+                       "into a NEW module of under 250 lines with write_file and import it, then remove that part with replace_in_file.")
             elif hit_limit or unclosed or not clean:
                 msg = ("ERROR: Your reply was cut off by the output limit before any complete tool call. "
                        "Think less and write smaller files (split large ones), then call your tools.")
