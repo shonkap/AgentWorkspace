@@ -183,6 +183,22 @@ class Tests(unittest.TestCase):
         self.assertIn("REFUSED", model.seen[3][-1]["content"])
         self.assertIn("y = 2", model.seen[4][-1]["content"])
 
+    def test_read_coverage_and_protected_cap(self):
+        big = "".join(f"line{i}\n" for i in range(1, 501))
+        sb, model = make_env(self, {"check.py": CHECK, "big.py": big, "judge.py": big},
+                             ['<read_file path="big.py" lines="1-150"/>', '<read_file path="big.py" lines="10-20"/>',
+                              '<read_file path="big.py" lines="151-300"/>', '<read_file path="judge.py" lines="1-150"/>',
+                              '<read_file path="judge.py" lines="151-400"/>', '<read_file path="judge.py" lines="300-450"/>'],
+                             max_iterations=7, status_every=0, readonly_nudge=99, initial_status=False)
+        W.run_task(task_file(sb, "WORKDIR: proj\nPROTECT: judge.py\nx\nVERIFY: python3 check.py"), 1)
+        r = [m[-1]["content"] for m in model.seen[1:]]
+        self.assertIn("line150", r[0])
+        self.assertIn("UNCHANGED", r[1])
+        self.assertIn("line300", r[2])
+        self.assertIn("lines 151-200 of 500", r[4])
+        self.assertNotIn("line201", r[4])
+        self.assertIn("REFUSED", r[5])
+
     def test_initial_status_and_code_map(self):
         sb, model = make_env(self, {"check.py": CHECK, "lib.py": "class Foo:\n    def bar(self):\n        pass\n"},
                              ["<list_dir/>"], max_iterations=1, status_every=0)

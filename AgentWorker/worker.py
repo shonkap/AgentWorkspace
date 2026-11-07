@@ -83,6 +83,7 @@ class Config:
     auto_verify_seconds: float = 90.0     # after an edit-only turn, run the checks for the model if they take at most this long (0 = off)
     initial_status: bool = True           # existing project: run the checks before turn 1 and pin the failures
     code_map: bool = True                 # existing project: show a file/definition outline in the task prompt
+    protected_read_lines: int = 200       # read_file shows at most this many lines of each PROTECTED file per task
     min_read_lines: int = 150             # read_file ranges smaller than this are widened (0 = off)
     readonly_nudge: int = 8               # this many turns of ONLY reading (no command, no edit) triggers a 'run something' nudge
     plateau_turns: int = 15               # the same checks failing for this many turns triggers a 'step back' nudge
@@ -232,7 +233,8 @@ class TaskState:
     status_history: list = field(default_factory=list)   # failing-check sets of the periodic status checks
     readonly_streak: int = 0
     protected: dict = field(default_factory=dict)        # rel path -> original text of files the agent must not change
-    reads: dict = field(default_factory=dict)            # (rel, lines) -> (content hash, turn) of reads still in the history
+    reads: dict = field(default_factory=dict)            # rel -> (content hash, set of line numbers shown) still in the history
+    protected_lines_read: dict = field(default_factory=dict)   # rel -> lines of a protected file shown so far
     read_locked: bool = False                            # reading is refused until the agent edits or runs something
     iteration: int = 0
     verify_cache: dict = field(default_factory=dict)     # verify cmd -> (version, exit code, output)
@@ -834,18 +836,9 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
         abs_path, rel = resolve_container_path(state, path)
     except ValueError as e:
         return f"Failed to read file: {e}"
-    if state.read_locked and any(k[0] == rel for k in state.reads):
-        return READ_LOCK_MSG
     text, err = container_read(abs_path)
     if text is None:
         return f"Failed to read file: {rel} {err}."
-    key = (rel, (lines_spec or "").replace(" ", ""))
-    digest = short_hash(text)
-    prev = state.reads.get(key)
-    if prev and prev[0] == digest:
-        return (f"{rel} is UNCHANGED since you read it at turn {prev[1]}; that result is still in this conversation above. "
-                "Do not read it again: use what you already have, and act (edit or run).")
-    state.reads[key] = (digest, state.iteration)
     if "\x00" in text[:2048]:
         return f"{rel} looks like a binary file."
 
@@ -860,10 +853,43 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
             # small chunks cost one turn each: widen the window (some context above, more below)
             start = max(1, start - 20)
             end = min(len(all_lines), start + CFG.min_read_lines - 1)
-    selected = all_lines[start - 1:end]
-    numbered = "\n".join(f"{i:>5} | {line}" for i, line in enumerate(selected, start))
-    header = f"{state.container_dir}/{rel} (lines {start}-{end} of {len(all_lines)}; the numbers are display-only, not part of the file):"
-    return f"{header}\n{truncate_output(numbered, CFG.max_read_chars)}"
+    if end < start:
+        return f"Failed to read file: {rel} has only {len(all_lines)} lines."
+
+    digest = short_hash(text)
+    seen_digest, covered = state.reads.get(rel, (None, set()))
+    if seen_digest != digest:
+        covered = set()                     # never read, or changed since: everything is new
+    wanted = set(range(start, end + 1))
+    new_lines = wanted - covered
+    if state.read_locked and len(new_lines) < 0.5 * len(wanted):
+        return READ_LOCK_MSG
+    if not new_lines:
+        return (f"{rel} lines {start}-{end} are UNCHANGED since you read them; that result is still in this conversation "
+                "above. Do not read them again: use what you already have, and act (edit or run).")
+    if rel in state.protected:
+        budget = CFG.protected_read_lines - state.protected_lines_read.get(rel, 0)
+        if budget <= 0:
+            return (f"REFUSED: {rel} is a protected checker and you have already read {CFG.protected_read_lines} lines of it. "
+                    "Do not study it: the AUTHORITATIVE STATUS lists every failing check with its reason, and running it shows the "
+                    f"rest. To see the code of ONE check, use run_command: grep -n -A 15 'words from the check name' {rel}")
+        end = min(end, start + budget - 1)
+        state.protected_lines_read[rel] = state.protected_lines_read.get(rel, 0) + (end - start + 1)
+
+    # Cut at a line boundary (never hide the middle), so the lines reported as shown really were shown.
+    shown, size = [], 0
+    for i in range(start, end + 1):
+        line = f"{i:>5} | {all_lines[i - 1]}"
+        if shown and size + len(line) + 1 > CFG.max_read_chars:
+            break
+        shown.append(line)
+        size += len(line) + 1
+    last = start + len(shown) - 1
+    state.reads[rel] = (digest, covered | set(range(start, last + 1)))
+    header = (f"{state.container_dir}/{rel} (lines {start}-{last} of {len(all_lines)}; the numbers are display-only, not part "
+              "of the file):")
+    more = f"\n[stopped at line {last} to save context; read lines=\"{last + 1}-{end}\" for the rest]" if last < end else ""
+    return header + "\n" + "\n".join(shown) + more
 
 
 def execute_list_dir(state: TaskState, path: str) -> str:
@@ -1440,7 +1466,8 @@ def choose_think(state: TaskState, iteration: int):
     if mode in ("low", "medium", "high"):
         return mode
     if mode == "adaptive":
-        struggling = iteration == 1 or state.last_exit_code != 0 or state.trouble_turns > 0
+        struggling = (iteration <= 2 or state.last_exit_code != 0 or state.trouble_turns > 0
+                      or state.readonly_streak >= 3 or state.read_locked)
         if state.trouble_turns > 0:
             state.trouble_turns -= 1
         return struggling
@@ -1657,6 +1684,7 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
     if CFG.initial_status and state.preexisting_files and state.verify_cmds:
         # Start from the facts: run the checks once before the first turn and pin what fails.
         print("[*] Running the acceptance checks once before the first turn (existing project)...")
+        state.transcript = transcript
         periodic_status(state, 0)      # cannot complete here: no tool call has been made yet
         state.status_version = workdir_fingerprint(state)
 
