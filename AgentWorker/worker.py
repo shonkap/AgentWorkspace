@@ -81,6 +81,8 @@ class Config:
     notes_every: int = 8                  # the harness writes the progress notes itself when the model has not (0 = off)
     status_every: int = 10                # the harness runs the acceptance checks itself every N turns and tells the model the result (0 = off)
     auto_verify_seconds: float = 90.0     # after an edit-only turn, run the checks for the model if they take at most this long (0 = off)
+    initial_status: bool = True           # existing project: run the checks before turn 1 and pin the failures
+    code_map: bool = True                 # existing project: show a file/definition outline in the task prompt
     readonly_nudge: int = 8               # this many turns of ONLY reading (no command, no edit) triggers a 'run something' nudge
     plateau_turns: int = 15               # the same checks failing for this many turns triggers a 'step back' nudge
     fast_timeout: float = 90.0            # seconds; the small model only does short jobs, so don't wait minutes for it
@@ -89,7 +91,7 @@ class Config:
     max_iterations: int = 100
     model_retries: int = 2
     command_timeout: int = 600            # per command, enforced inside the container
-    max_output_chars: int = 4000          # command output shown to the model (head + tail)
+    max_output_chars: int = 8000          # command output shown to the model (head + tail)
     max_read_chars: int = 16000           # read_file output shown to the model (about 250 lines at once)
     max_history_chars: int = 0            # 0 = derive from num_ctx and num_predict
     max_notes_chars: int = 2500           # pinned summary of trimmed turns
@@ -1201,9 +1203,48 @@ def build_task_prompt(state: TaskState, goal: str) -> str:
                      "(e.g. /workspace/office-game) means this directory. Other files under /workspace, such as shared "
                      "reference images, can be read from the shell, but write only inside your working directory.")
     if state.preexisting_files:
-        parts.append("NOTE: your working directory already contains files from an earlier interrupted attempt. "
-                     "Inspect them with list_dir/read_file and continue rather than starting over.")
+        parts.append("NOTE: your working directory already contains files (an existing project or an earlier attempt). "
+                     "Continue from them rather than starting over.")
+        cmap = code_map(state)
+        if cmap:
+            parts.append("CODE MAP (made by the harness: files with their line counts and top-level definitions, so you can "
+                         "read exactly the parts you need with read_file lines=\"a-b\"):\n" + cmap)
     return "\n\n".join(parts)
+
+
+CODE_MAP_SCRIPT = r"""
+find . \( -name .git -o -name __pycache__ -o -name node_modules -o -name .pio -o -name venv -o -name .venv \) -prune -o -type f \
+  \( -name '*.py' -o -name '*.c' -o -name '*.h' -o -name '*.cpp' -o -name '*.js' -o -name '*.ts' -o -name '*.md' -o -name '*.txt' \
+     -o -name '*.json' -o -name '*.ini' -o -name '*.toml' -o -name '*.sh' \) -print | sort | head -n 60 | while read -r f; do
+  echo "${f#./} ($(wc -l < "$f") lines)"
+  case "$f" in *.py) grep -nE '^(class |def |    def )' "$f" | head -n 40 | sed 's/^/    /';; esac
+done
+"""
+
+
+def code_map(state: "TaskState", limit: int = 6000) -> str:
+    """A compact outline of the existing project: saves the model a dozen list/read turns at the start."""
+    if not CFG.code_map:
+        return ""
+    try:
+        code, out = cexec(["bash", "-c", CODE_MAP_SCRIPT], workdir=state.container_dir, timeout=30)
+    except Exception:
+        return ""
+    if code != 0 or not out.strip():
+        return ""
+    skip = set(state.protected)
+    lines, cur_skip = [], False
+    for line in out.splitlines():
+        if not line.startswith("    "):
+            name = line.split(" (")[0].removeprefix("./")
+            cur_skip = name in skip
+            if cur_skip:
+                line += "  [PROTECTED: run it, do not study it; its FAIL lines tell you what to fix]"
+        elif cur_skip:
+            continue
+        lines.append(line)
+    text = "\n".join(lines)
+    return text if len(text) <= limit else text[:limit] + "\n[code map truncated]"
 
 
 def render_task_message(state: TaskState) -> str:
@@ -1559,6 +1600,11 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
         {"role": "system", "content": build_system_prompt(state)},
         {"role": "user", "content": render_task_message(state)},
     ]
+    if CFG.initial_status and state.preexisting_files and state.verify_cmds:
+        # Start from the facts: run the checks once before the first turn and pin what fails.
+        print("[*] Running the acceptance checks once before the first turn (existing project)...")
+        periodic_status(state, 0)      # cannot complete here: no tool call has been made yet
+        state.status_version = state.version
 
     try:
         success, reason = _agent_loop(state, history, transcript)
@@ -1998,7 +2044,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         if restored:
             notes.append(f"WARNING: you changed protected file(s) {', '.join(restored)}; the harness restored the originals. "
                          "Never modify them: change your own code so it passes.")
-        auto_note = maybe_auto_attach_image(state, iteration, outputs)
+        auto_note = maybe_auto_attach_image(state, iteration, [o for (k, _), o in zip(calls, outputs) if k == "run_command"])
         if auto_note:
             notes.append(auto_note)
         plateau_note = update_plateau(state, iteration, outputs)

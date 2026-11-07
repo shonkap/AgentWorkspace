@@ -166,7 +166,7 @@ class Tests(unittest.TestCase):
 
     def test_status_uses_cache(self):
         sb, model = make_env(self, {"check.py": CHECK}, ["<run_command>python3 check.py</run_command>"] + ["<list_dir/>"] * 5,
-                             max_iterations=4, status_every=2, auto_verify_seconds=0)
+                             max_iterations=4, status_every=2, auto_verify_seconds=0, initial_status=False)
         events = []
         orig = W.EventLog.emit
         W.EventLog.emit = lambda self_, ev, **kw: events.append((ev, kw))
@@ -174,6 +174,18 @@ class Tests(unittest.TestCase):
         W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
         verifies = [kw for ev, kw in events if ev == "verify"]
         self.assertTrue(verifies and all(kw.get("cached") for kw in verifies), verifies)
+
+    def test_initial_status_and_code_map(self):
+        sb, model = make_env(self, {"check.py": CHECK, "lib.py": "class Foo:\n    def bar(self):\n        pass\n"},
+                             ["<list_dir/>"], max_iterations=1, status_every=0)
+        W.run_task(task_file(sb, "WORKDIR: proj\nPROTECT: check.py\nx\nVERIFY: python3 check.py"), 1)
+        first = model.seen[0]
+        task_msg, last = first[1]["content"], first[-1]["content"]
+        self.assertIn("CODE MAP", task_msg)
+        self.assertIn("    2:    def bar(self):", task_msg)
+        self.assertIn("check.py (7 lines)  [PROTECTED", task_msg)
+        self.assertIn("AUTHORITATIVE STATUS", last)
+        self.assertIn("val exists -> write val.txt", last)
 
 
 if __name__ == "__main__":
