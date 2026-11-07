@@ -556,6 +556,31 @@ def container_read(abs_path: str, limit: int = 1_048_576) -> tuple[Optional[str]
 FINGERPRINT_SCRIPT = (f"find . \\( {PRUNE_EXPR} \\) -prune -o -type f -print0 | sort -z | xargs -0 -r md5sum | md5sum")
 
 
+def _cache_path(state: "TaskState") -> str:
+    return os.path.join(CFG.logs_dir, "verify_cache_" + re.sub(r"[^A-Za-z0-9_.-]", "_", state.container_dir.strip("/")) + ".json")
+
+
+def load_verify_cache(state: "TaskState") -> None:
+    """Results of acceptance checks from earlier runs on exactly the same files (same content fingerprint) are reused."""
+    try:
+        with open(_cache_path(state), encoding="utf-8") as f:
+            data = json.load(f)
+        for cmd, (fp, code, out, secs) in data.items():
+            state.verify_cache[cmd] = (fp, code, out)
+            state.verify_seconds[cmd] = secs
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def save_verify_cache(state: "TaskState") -> None:
+    data = {cmd: [fp, code, out, state.verify_seconds.get(cmd, 0)] for cmd, (fp, code, out) in state.verify_cache.items()}
+    try:
+        with open(_cache_path(state), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
 def workdir_fingerprint(state: "TaskState") -> str:
     """Content hash of every file in the task directory (not mtimes: regenerating identical files changes nothing)."""
     try:
@@ -711,6 +736,7 @@ def execute_run_command(state: TaskState, command: str) -> str:
     if is_check:
         state.verify_cache[clean_cmd] = (workdir_fingerprint(state), exit_code, output)
         state.verify_seconds[clean_cmd] = time.monotonic() - t0
+        save_verify_cache(state)
 
     state.last_exit_code = exit_code
     if exit_code == 0:
@@ -1647,6 +1673,7 @@ def run_acceptance_checks(state: TaskState) -> Optional[str]:
                 return f"ACCEPTANCE CHECK COULD NOT RUN\nCommand: {cmd}\nHarness error: {e}"
             state.verify_cache[key] = (workdir_fingerprint(state), code, out)
             state.verify_seconds[key] = time.monotonic() - t0
+            save_verify_cache(state)
             state.events.emit("verify", cmd=cmd, exit_code=code, seconds=round(state.verify_seconds[key], 1))
         if code != 0:
             return (f"ACCEPTANCE CHECK FAILED\nCommand: {cmd}\nExit Code: {code}\n"
@@ -1679,6 +1706,7 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
         return False, reason, transcript
     state.verify_cmds = verify_cmds
     state.quick_cmds = parse_quick_checks(raw)
+    load_verify_cache(state)
     unreadable = snapshot_protected(state, parse_protected_files(raw))
     if unreadable:
         reason = f"Protected file(s) missing from {state.container_dir}: {', '.join(unreadable)}."
