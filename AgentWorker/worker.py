@@ -84,6 +84,7 @@ class Config:
     initial_status: bool = True           # existing project: run the checks before turn 1 and pin the failures
     code_map: bool = True                 # existing project: show a file/definition outline in the task prompt
     protected_read_lines: int = 200       # read_file shows at most this many lines of each PROTECTED file per task
+    blind_edit_limit: int = 3             # after this many edit-only turns in a row, the harness runs the checks even if slow
     min_read_lines: int = 150             # read_file ranges smaller than this are widened (0 = off)
     readonly_nudge: int = 8               # this many turns of ONLY reading (no command, no edit) triggers a 'run something' nudge
     plateau_turns: int = 15               # the same checks failing for this many turns triggers a 'step back' nudge
@@ -235,6 +236,7 @@ class TaskState:
     protected: dict = field(default_factory=dict)        # rel path -> original text of files the agent must not change
     reads: dict = field(default_factory=dict)            # rel -> (content hash, set of line numbers shown) still in the history
     protected_lines_read: dict = field(default_factory=dict)   # rel -> lines of a protected file shown so far
+    blind_edits: int = 0                                 # consecutive turns that edited files without running anything
     read_locked: bool = False                            # reading is refused until the agent edits or runs something
     iteration: int = 0
     verify_cache: dict = field(default_factory=dict)     # verify cmd -> (version, exit code, output)
@@ -2185,8 +2187,11 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
 
         edited = any(k in ("write_file", "replace_in_file") for k, _ in calls)
         ran = any(k == "run_command" for k, _ in calls)
+        state.blind_edits = state.blind_edits + 1 if (edited and not ran) else (0 if ran else state.blind_edits)
+        cheap = sum(state.verify_seconds.get(fix_command_paths(v).strip(), 9999) for v in state.verify_cmds) <= CFG.auto_verify_seconds
         if (CFG.auto_verify_seconds and edited and not ran and state.verify_cmds and not wants_complete
-                and sum(state.verify_seconds.get(fix_command_paths(v).strip(), 9999) for v in state.verify_cmds) <= CFG.auto_verify_seconds):
+                and (cheap or state.blind_edits >= CFG.blind_edit_limit)):
+            state.blind_edits = 0
             failure = run_acceptance_checks(state)
             state.events.emit("auto_verify", turn=iteration, passed=failure is None)
             if failure is None:
@@ -2198,7 +2203,8 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             else:
                 notes.append("AUTO-CHECK: you edited files without running anything, so the harness ran the acceptance checks for you:\n"
                              + failure[:3500])
-                update_plateau(state, iteration, [failure])
+                state.status_version = workdir_fingerprint(state)
+                periodic_status(state, iteration)        # cached: just refreshes the pinned status and FOCUS
 
         committed = git_checkpoint(state, f"turn {iteration}")
         if committed:
