@@ -161,8 +161,8 @@ class Tests(unittest.TestCase):
         self.assertIn("x = 1", model.seen[1][-1]["content"])
         self.assertIn("UNCHANGED", model.seen[2][-1]["content"])
         self.assertIn("LOCKED", model.seen[3][-1]["content"])
-        self.assertIn("REFUSED: read_file/list_dir are locked", model.seen[4][-1]["content"])
-        self.assertIn("REFUSED: read_file/list_dir are locked", model.seen[6][-1]["content"])   # a command does not unlock
+        self.assertIn("REFUSED: re-reading files and list_dir are locked", model.seen[4][-1]["content"])
+        self.assertIn("REFUSED: re-reading files and list_dir are locked", model.seen[6][-1]["content"])   # a command does not unlock
 
     def test_status_uses_cache(self):
         sb, model = make_env(self, {"check.py": CHECK}, ["<run_command>python3 check.py</run_command>"] + ["<list_dir/>"] * 5,
@@ -174,6 +174,14 @@ class Tests(unittest.TestCase):
         W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
         verifies = [kw for ev, kw in events if ev == "verify"]
         self.assertTrue(verifies and all(kw.get("cached") for kw in verifies), verifies)
+
+    def test_lock_allows_unread_file(self):
+        sb, model = make_env(self, {"check.py": CHECK, "a.py": "x = 1\n", "b.py": "y = 2\n"},
+                             ['<read_file path="a.py"/>'] * 3 + ['<read_file path="b.py"/>'],
+                             max_iterations=5, status_every=0, readonly_nudge=2, initial_status=False)
+        W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
+        self.assertIn("REFUSED", model.seen[3][-1]["content"])
+        self.assertIn("y = 2", model.seen[4][-1]["content"])
 
     def test_initial_status_and_code_map(self):
         sb, model = make_env(self, {"check.py": CHECK, "lib.py": "class Foo:\n    def bar(self):\n        pass\n"},

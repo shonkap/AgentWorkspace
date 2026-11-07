@@ -83,6 +83,7 @@ class Config:
     auto_verify_seconds: float = 90.0     # after an edit-only turn, run the checks for the model if they take at most this long (0 = off)
     initial_status: bool = True           # existing project: run the checks before turn 1 and pin the failures
     code_map: bool = True                 # existing project: show a file/definition outline in the task prompt
+    min_read_lines: int = 150             # read_file ranges smaller than this are widened (0 = off)
     readonly_nudge: int = 8               # this many turns of ONLY reading (no command, no edit) triggers a 'run something' nudge
     plateau_turns: int = 15               # the same checks failing for this many turns triggers a 'step back' nudge
     fast_timeout: float = 90.0            # seconds; the small model only does short jobs, so don't wait minutes for it
@@ -234,10 +235,9 @@ class TaskState:
     reads: dict = field(default_factory=dict)            # (rel, lines) -> (content hash, turn) of reads still in the history
     read_locked: bool = False                            # reading is refused until the agent edits or runs something
     iteration: int = 0
-    version: int = 0                                     # bumped by every edit and every non-check command
     verify_cache: dict = field(default_factory=dict)     # verify cmd -> (version, exit code, output)
     verify_seconds: dict = field(default_factory=dict)   # verify cmd -> seconds its last run took
-    status_version: int = -1                             # version at the last periodic status check
+    status_version: str = ""                             # work-dir fingerprint at the last periodic status check
     last_readonly_nudge: int = 0
     learned: list = field(default_factory=list)          # LEARNED: lines from the model's own replies
     plan: str = ""                                       # its latest PLAN: line
@@ -255,6 +255,28 @@ class TaskState:
     stats: dict = field(default_factory=lambda: {
         "turns": 0, "gen_tokens": 0, "gen_seconds": 0.0, "think_chars": 0, "wall_seconds": 0.0,
         "truncated_replies": 0, "context_near_limit": 0, "budget_exhausted": 0})
+
+
+class LiveTranscript(list):
+    """The task transcript, also appended to logs/live_<task>.txt as it grows, so a run can be followed with tail -f."""
+
+    def __init__(self, path: Optional[str] = None):
+        super().__init__()
+        self.path = path
+        if path:
+            try:
+                open(path, "w", encoding="utf-8").close()
+            except OSError:
+                self.path = None
+
+    def append(self, text: str) -> None:
+        super().append(text)
+        if self.path:
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(text + "\n\n")
+            except OSError:
+                pass
 
 
 def log_to_transcript(state: "TaskState", text: str) -> None:
@@ -320,7 +342,6 @@ def restore_protected(state: "TaskState") -> list[str]:
             container_write(abs_path, text)
             restored.append(rel)
     if restored:
-        state.version += 1
         state.events.emit("protected_restored", files=restored)
     return restored
 
@@ -521,6 +542,18 @@ def container_read(abs_path: str, limit: int = 1_048_576) -> tuple[Optional[str]
     return out, ""
 
 
+FINGERPRINT_SCRIPT = (f"find . \\( {PRUNE_EXPR} \\) -prune -o -type f -print0 | sort -z | xargs -0 -r md5sum | md5sum")
+
+
+def workdir_fingerprint(state: "TaskState") -> str:
+    """Content hash of every file in the task directory (not mtimes: regenerating identical files changes nothing)."""
+    try:
+        code, out = cexec(["bash", "-c", FINGERPRINT_SCRIPT], workdir=state.container_dir, timeout=60)
+    except Exception:
+        return f"error-{time.time()}"
+    return out.strip() if code == 0 else f"error-{time.time()}"
+
+
 def container_find_empty_files(directory: str, limit: int = 20) -> list[str]:
     names = " ".join(f"-not -name {shlex.quote(n)}" for n in sorted(EMPTY_FILE_OK))
     script = f"find . \\( {PRUNE_EXPR} \\) -prune -o -type f -empty {names} -print | head -n {limit}"
@@ -658,8 +691,6 @@ def execute_run_command(state: TaskState, command: str) -> str:
             return a_msg
 
     is_check = clean_cmd in [fix_command_paths(v).strip() for v in state.verify_cmds]
-    if not is_check:
-        state.version += 1          # an arbitrary command may change files
     t0 = time.monotonic()
     try:
         exit_code, output = container_exec(state, clean_cmd)
@@ -667,7 +698,7 @@ def execute_run_command(state: TaskState, command: str) -> str:
         state.last_exit_code = 1
         return f"Container execution error: {e}"
     if is_check:
-        state.verify_cache[clean_cmd] = (state.version, exit_code, output)
+        state.verify_cache[clean_cmd] = (workdir_fingerprint(state), exit_code, output)
         state.verify_seconds[clean_cmd] = time.monotonic() - t0
 
     state.last_exit_code = exit_code
@@ -753,7 +784,6 @@ def execute_write_file(state: TaskState, path: str, content: str) -> str:
         return f"Failed to write file: {err}"
 
     state.unverified_changes = True
-    state.version += 1
     if not text.strip() and posixpath.basename(abs_path) not in EMPTY_FILE_OK:
         return f"ERROR: {state.container_dir}/{rel} was written empty. Provide the file contents."
     return f"Successfully wrote {len(text)} characters to {state.container_dir}/{rel}"
@@ -790,23 +820,22 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
     if err:
         return f"Failed to edit file: {err}"
     state.unverified_changes = True
-    state.version += 1
     return f"Successfully edited {state.container_dir}/{rel} (1 replacement)"
 
 
-READ_LOCK_MSG = ("REFUSED: read_file/list_dir are locked because you have read for many turns without changing anything. You "
-                 "already have enough information. Make the change you believe is needed NOW (replace_in_file / write_file); "
+READ_LOCK_MSG = ("REFUSED: re-reading files and list_dir are locked because you have read for many turns without changing "
+                 "anything. You already read this file; its contents are above. Make the change you believe is needed NOW (replace_in_file / write_file); "
                  "reading unlocks as soon as you edit a file. If you need one exact line, use run_command with grep -n.")
 
 
 def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) -> str:
     state.tool_calls += 1
-    if state.read_locked:
-        return READ_LOCK_MSG
     try:
         abs_path, rel = resolve_container_path(state, path)
     except ValueError as e:
         return f"Failed to read file: {e}"
+    if state.read_locked and any(k[0] == rel for k in state.reads):
+        return READ_LOCK_MSG
     text, err = container_read(abs_path)
     if text is None:
         return f"Failed to read file: {rel} {err}."
@@ -827,6 +856,10 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
         if not m:
             return f"Failed to read file: lines must look like lines=\"10-50\", got {lines_spec!r}."
         start, end = max(int(m.group(1)), 1), min(int(m.group(2)), len(all_lines))
+        if CFG.min_read_lines and end - start + 1 < CFG.min_read_lines:
+            # small chunks cost one turn each: widen the window (some context above, more below)
+            start = max(1, start - 20)
+            end = min(len(all_lines), start + CFG.min_read_lines - 1)
     selected = all_lines[start - 1:end]
     numbered = "\n".join(f"{i:>5} | {line}" for i, line in enumerate(selected, start))
     header = f"{state.container_dir}/{rel} (lines {start}-{end} of {len(all_lines)}; the numbers are display-only, not part of the file):"
@@ -1538,7 +1571,7 @@ def run_acceptance_checks(state: TaskState) -> Optional[str]:
     for cmd in state.verify_cmds:
         key = fix_command_paths(cmd).strip()
         cached = state.verify_cache.get(key)
-        if cached and cached[0] == state.version:
+        if cached and cached[0] == workdir_fingerprint(state):
             code, out = cached[1], cached[2]
             state.events.emit("verify", cmd=cmd, exit_code=code, cached=True)
         else:
@@ -1549,7 +1582,7 @@ def run_acceptance_checks(state: TaskState) -> Optional[str]:
             except Exception as e:
                 state.events.emit("verify", cmd=cmd, error=str(e))
                 return f"ACCEPTANCE CHECK COULD NOT RUN\nCommand: {cmd}\nHarness error: {e}"
-            state.verify_cache[key] = (state.version, code, out)
+            state.verify_cache[key] = (workdir_fingerprint(state), code, out)
             state.verify_seconds[key] = time.monotonic() - t0
             state.events.emit("verify", cmd=cmd, exit_code=code, seconds=round(state.verify_seconds[key], 1))
         if code != 0:
@@ -1565,7 +1598,7 @@ def run_acceptance_checks(state: TaskState) -> Optional[str]:
 def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
     """Run one task. Returns (success, reason, transcript)."""
     task_name = os.path.basename(task_path)
-    transcript: list[str] = []
+    transcript: list[str] = LiveTranscript(os.path.join(CFG.logs_dir, f"live_{os.path.splitext(task_name)[0]}.txt"))
 
     with open(task_path, "r", encoding="utf-8") as f:
         raw = f.read().strip()
@@ -1604,7 +1637,7 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
         # Start from the facts: run the checks once before the first turn and pin what fails.
         print("[*] Running the acceptance checks once before the first turn (existing project)...")
         periodic_status(state, 0)      # cannot complete here: no tool call has been made yet
-        state.status_version = state.version
+        state.status_version = workdir_fingerprint(state)
 
     try:
         success, reason = _agent_loop(state, history, transcript)
@@ -2018,8 +2051,8 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             return False, f"Stuck: the same action produced the same result {worst} times."
 
         if (CFG.status_every and state.verify_cmds and iteration - state.last_status_turn >= CFG.status_every and not wants_complete
-                and state.version != state.status_version):
-            state.status_version = state.version
+                and workdir_fingerprint(state) != state.status_version):
+            state.status_version = workdir_fingerprint(state)
             done = periodic_status(state, iteration)
             if done:
                 transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
@@ -2036,8 +2069,8 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             state.last_readonly_nudge = iteration
             state.events.emit("readonly_nudge", turn=iteration, streak=state.readonly_streak)
             first = state.verify_cmds[0] if state.verify_cmds else "your program or its tests"
-            text = (f"NUDGE: you have read for {state.readonly_streak} turns without changing any file. read_file/list_dir are now LOCKED "
-                    "until you edit a file. Make the change you already know is needed for the FIRST failing check "
+            text = (f"NUDGE: you have read for {state.readonly_streak} turns without changing any file. re-reading files and list_dir are now "
+                    "LOCKED until you edit a file. Make the change you already know is needed for the FIRST failing check "
                     f"(`{first}` shows them), using replace_in_file, and rerun the check in the same reply.")
             log_to_transcript(state, f"=== Read-only lock at turn {iteration} ===\n{text}")
             state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + text
