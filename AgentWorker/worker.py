@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import base64
 import hashlib
 import io
 import json
@@ -72,13 +73,23 @@ class Config:
     think: str = "adaptive"               # adaptive | auto (model default) | on | off | low/medium/high
     think_supported: bool = True          # runtime flag: flipped off if the model rejects `think`
     fast_num_ctx: int = 8192              # context for the small model on the 1080 (display shares that card)
+    vision: str = "auto"                  # auto | on | off: let the model look at PNG/JPG files with <view_image>
+    vision_supported: Optional[bool] = None   # runtime: set by detect_vision() or when the model refuses an image
+    max_image_bytes: int = 3 * 1024 * 1024
+    max_auto_views: int = 12              # screenshots attached automatically per task
+    auto_view_gap: int = 6                # at least this many turns between automatic attachments
+    notes_every: int = 8                  # the harness writes the progress notes itself when the model has not (0 = off)
+    status_every: int = 10                # the harness runs the acceptance checks itself every N turns and tells the model the result (0 = off)
+    readonly_nudge: int = 8               # this many turns of ONLY reading (no command, no edit) triggers a 'run something' nudge
+    plateau_turns: int = 15               # the same checks failing for this many turns triggers a 'step back' nudge
+    fast_timeout: float = 90.0            # seconds; the small model only does short jobs, so don't wait minutes for it
     temperature: float = 0.6              # DeepSeek's recommended range is 0.5-0.7
 
     max_iterations: int = 100
     model_retries: int = 2
     command_timeout: int = 600            # per command, enforced inside the container
     max_output_chars: int = 4000          # command output shown to the model (head + tail)
-    max_read_chars: int = 8000            # read_file output shown to the model
+    max_read_chars: int = 16000           # read_file output shown to the model (about 250 lines at once)
     max_history_chars: int = 0            # 0 = derive from num_ctx and num_predict
     max_notes_chars: int = 2500           # pinned summary of trimmed turns
 
@@ -86,6 +97,7 @@ class Config:
     stuck_abort_at: int = 5               # ... and this many -> fail the task
     max_verify_failures: int = 5
     max_task_attempts: int = 3            # crash-recovery retries before a task is failed
+    auto_complete: bool = True            # finish by itself when the acceptance checks pass (the model need not say so)
     ask_turns_left: bool = True           # the model ends every reply with <turns_left>N</turns_left>
     max_extensions: int = 3               # how many times the turn budget may be extended
     extend_max_estimate: int = 40         # estimates above this never earn an extension
@@ -141,7 +153,7 @@ def init_runtime(need_docker: bool = True) -> None:
     if need_docker:
         docker_client = docker.from_env()
     heavy_client = ollama.Client(host=CFG.heavy_host, timeout=1800.0)
-    fast_client = ollama.Client(host=CFG.fast_host, timeout=240.0)
+    fast_client = ollama.Client(host=CFG.fast_host, timeout=CFG.fast_timeout)
 
 
 # ================= EVENT LOG (JSONL) =================
@@ -208,12 +220,36 @@ class TaskState:
     hidden_error: bool = False         # last command exited 0 but printed a Traceback / 'Unhandled exception'
     estimates: list = field(default_factory=list)   # [(turn, model's <turns_left> estimate)]
     extensions: int = 0
+    transcript: Optional[list] = None                # the task's text-log transcript (set by the agent loop)
+    last_notes_turn: int = 0
+    last_self_notes_turn: int = 0
+    last_status_turn: int = 0
+    status_block: str = ""                            # the latest authoritative status, shown on EVERY turn until replaced
+    status_history: list = field(default_factory=list)   # failing-check sets of the periodic status checks
+    readonly_streak: int = 0
+    last_readonly_nudge: int = 0
+    learned: list = field(default_factory=list)          # LEARNED: lines from the model's own replies
+    plan: str = ""                                       # its latest PLAN: line
+    auto_views: int = 0
+    last_auto_view: int = -99
+    fail_log: list = field(default_factory=list)          # [(turn, frozenset of FAIL check names seen that turn)]
+    last_plateau_nudge: int = -99
+    pending_images: list = field(default_factory=list)   # raw image bytes to show the model with its next turn only
+    summarizer_failures: int = 0                     # consecutive failures of the small model's summaries
+    zero_checked_turn: int = -1                      # turn of the '0 turns left' estimate already acted on
+    last_ask_turn: int = -99                         # turn of the last explicit 'how many turns left?' question
     pending_note: str = ""                          # one-off message shown with the next model call
     trouble_turns: int = 0             # adaptive thinking stays on for a few turns after trouble
     force_think_off: int = 0           # turns to disable thinking after it ate the output budget
     stats: dict = field(default_factory=lambda: {
         "turns": 0, "gen_tokens": 0, "gen_seconds": 0.0, "think_chars": 0, "wall_seconds": 0.0,
         "truncated_replies": 0, "context_near_limit": 0, "budget_exhausted": 0})
+
+
+def log_to_transcript(state: "TaskState", text: str) -> None:
+    """Add a harness decision (budget question, extension, auto-completion) to the task's text log."""
+    if state.transcript is not None:
+        state.transcript.append(text)
 
 
 def new_task_state(task_name: str, workdir: Optional[str] = None) -> TaskState:
@@ -235,8 +271,13 @@ def parse_task_file(text: str) -> tuple[str, list[str], Optional[str]]:
     verify = [m.group(1).strip() for m in re.finditer(r"^\s*VERIFY:\s*(.+?)\s*$", text, re.IGNORECASE | re.MULTILINE)]
     m = re.search(r"^\s*WORKDIR:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)
     workdir = os.path.basename(m.group(1).rstrip("/")) if m else None
-    goal = re.sub(r"^\s*(?:VERIFY|WORKDIR):.*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+    goal = re.sub(r"^\s*(?:VERIFY|WORKDIR|REQUIRE):.*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
     return goal, [v for v in verify if v], workdir
+
+
+def parse_required_files(text: str) -> list[str]:
+    """`REQUIRE: some_file.py` lines name files that must already exist in the working directory."""
+    return [m.group(1) for m in re.finditer(r"^\s*REQUIRE:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)]
 
 
 # ================= SAFETY LAYERS =================
@@ -346,6 +387,7 @@ OPTIONAL_TOOLS = {
     "git": "per-turn git checkpoints and the patch export are disabled",
     "python3": "tasks that run Python will fail",
     "pip": "the agent cannot install Python packages",
+    "base64": "the agent cannot look at images with view_image",
 }
 
 
@@ -725,6 +767,132 @@ def execute_list_dir(state: TaskState, path: str) -> str:
     return f"{where}:\n" + "\n".join(lines) + suffix
 
 
+def vision_enabled() -> bool:
+    return CFG.vision != "off" and CFG.vision_supported is not False
+
+
+def detect_vision() -> None:
+    """Ask Ollama whether the heavy model can look at images. 'auto' also switches itself off if the model refuses one."""
+    if CFG.vision == "off":
+        CFG.vision_supported = False
+        print("[*] Image viewing is turned off (--vision off).")
+        return
+    if CFG.vision == "on":
+        CFG.vision_supported = True
+        print("[*] Image viewing is forced on (--vision on).")
+        return
+    try:
+        caps = _field(heavy_client.show(CFG.heavy_model), "capabilities", None)
+    except Exception as e:
+        print(f"[*] Could not read {CFG.heavy_model}'s capabilities ({e}); image viewing stays on and switches itself "
+              "off if the model refuses an image.")
+        return
+    if isinstance(caps, (list, tuple)):
+        CFG.vision_supported = "vision" in [str(c).lower() for c in caps]
+        print(f"[*] {CFG.heavy_model} can look at images: " + ("yes (view_image is enabled)" if CFG.vision_supported
+                                                              else "no, it is text-only (view_image is disabled)"))
+    else:
+        print("[*] Ollama did not report capabilities; image viewing stays on and switches itself off if the model refuses an image.")
+
+
+IMAGE_PATH_RE = re.compile(r"([\w./~-]+\.(?:png|jpe?g))\b", re.IGNORECASE)
+IMAGE_HINT_RE = re.compile(r"screenshot|shot|frame|saved|FAIL", re.IGNORECASE)
+FAIL_LINE_RE = re.compile(r"^FAIL\s+(.+?)(?:\s+->.*)?$", re.MULTILINE)
+
+
+def load_image(state: TaskState, path: str) -> tuple[Optional[bytes], str]:
+    """Read a PNG or JPEG from the sandbox (read-only, any folder). Returns (bytes, description) or (None, error)."""
+    p = path.replace("\xa0", "").strip()
+    if not re.search(r"\.(?:png|jpe?g)$", p, re.IGNORECASE):
+        return None, "Failed to load image: only .png and .jpg files can be viewed."
+    if p.startswith("/"):
+        abs_path = rel = posixpath.normpath(p)
+    else:
+        try:
+            abs_path, rel = resolve_container_path(state, p)
+        except ValueError as e:
+            return None, f"Failed to load image: {e}"
+    code, out = cexec(["bash", "-c", 'test -f "$1" && head -c "$2" -- "$1" | base64 -w0', "_", abs_path, str(CFG.max_image_bytes + 1)])
+    if code != 0 or not out.strip():
+        return None, f"Failed to load image: {rel} does not exist or is not a file."
+    try:
+        raw = base64.b64decode(out.strip())
+    except Exception:
+        return None, f"Failed to load image: {rel} could not be read."
+    if len(raw) > CFG.max_image_bytes:
+        return None, f"Failed to load image: {rel} is larger than {CFG.max_image_bytes // (1024 * 1024)} MB; save a smaller screenshot."
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        kind = "PNG"
+        size = f"{int.from_bytes(raw[16:20], 'big')}x{int.from_bytes(raw[20:24], 'big')} " if len(raw) >= 24 else ""
+    elif raw[:3] == b"\xff\xd8\xff":
+        kind, size = "JPEG", ""
+    else:
+        return None, f"Failed to load image: {rel} is not a PNG or JPEG file."
+    return raw, f"{size}{kind} image {abs_path} ({len(raw)} bytes)"
+
+
+def execute_view_image(state: TaskState, path: str) -> str:
+    """Load an image. It is shown to the model with its NEXT turn only (never stored in the history)."""
+    state.tool_calls += 1
+    if not vision_enabled():
+        return "This model cannot look at images. Verify how things look with the structural checks instead."
+    raw, msg = load_image(state, path)
+    if raw is None:
+        return msg
+    state.pending_images = [raw]
+    print(f"[Tool: view_image] {msg}")
+    return (f"Loaded {msg}. It is shown to you WITH THE NEXT TURN only: describe what you see in your reply "
+            "(layout, objects, anything that looks wrong), then fix what is wrong.")
+
+
+def maybe_auto_attach_image(state: TaskState, iteration: int, outputs: list[str]) -> Optional[str]:
+    """If a command's output mentions a screenshot file (for example a failing check saying 'see shot.png'), show it to the
+    model automatically, so it sees the picture without having to think of asking. Rate-limited."""
+    if (not vision_enabled() or state.pending_images or state.auto_views >= CFG.max_auto_views
+            or iteration - state.last_auto_view < CFG.auto_view_gap):
+        return None
+    candidates: list[str] = []
+    for text in outputs:
+        for line in text.splitlines():
+            if IMAGE_HINT_RE.search(line):
+                candidates += IMAGE_PATH_RE.findall(line)
+    for cand in reversed(candidates):
+        raw, msg = load_image(state, cand)
+        if raw is not None:
+            state.pending_images = [raw]
+            state.last_auto_view = iteration
+            state.auto_views += 1
+            state.events.emit("image_auto_attached", turn=iteration, path=cand)
+            print(f"[view_image] {cand} was mentioned in the output; attaching it to the next turn automatically.")
+            return (f"NOTE: the image {cand} was mentioned in the output, so it is attached to your next turn automatically "
+                    f"({msg}). Look at it and describe what you see before you change anything.")
+    return None
+
+
+def update_plateau(state: TaskState, iteration: int, outputs: list[str]) -> Optional[str]:
+    """If the same check(s) have failed on EVERY run for many turns, the current theory is probably wrong: say so."""
+    names: set[str] = set()
+    for o in outputs:
+        names |= {m.strip() for m in FAIL_LINE_RE.findall(o)}
+    if names:
+        state.fail_log.append((iteration, frozenset(names)))
+    window = [(t, fs) for t, fs in state.fail_log if t > iteration - CFG.plateau_turns]
+    recent = [fs for _, fs in window]
+    lasted = bool(window) and window[0][0] <= iteration - CFG.plateau_turns + 3     # the streak really spans ~plateau_turns
+    if len(recent) >= 4 and lasted and iteration - state.last_plateau_nudge >= CFG.plateau_turns:
+        always = sorted(frozenset.intersection(*recent))
+        if always:
+            state.last_plateau_nudge = iteration
+            state.events.emit("plateau_nudge", turn=iteration, checks=always)
+            return (f"PLATEAU: for the last {CFG.plateau_turns} turns these checks failed on every run: " + "; ".join(always)
+                    + ". Your current theory is probably wrong. Step back: (1) list three different possible causes, including "
+                    "code you have not read yet; (2) read the code that PRODUCES the failing result from end to end, not just the "
+                    "line you keep editing; (3) if the failure is visual and you can view images, look at the actual picture; "
+                    "(4) never make a check pass by hiding the symptom (for example filling or converting the saved screenshot): "
+                    "fix what is actually drawn.")
+    return None
+
+
 def execute_search_web(query: str) -> str:
     if not CFG.enable_internet:
         return "Web search is disabled."
@@ -752,10 +920,11 @@ TOOL_PATTERN = re.compile(
     r"|(?P<run><run_command>(?P<cmd>.*?)</run_command>)"
     r"|(?P<search><search_web>(?P<query>.*?)</search_web>)"
     r"|(?P<read><read_file\s+(?P<read_attrs>[^>]*?)/?>(?:\s*</read_file>)?)"
-    r"|(?P<ls><list_dir(?P<ls_attrs>\s+[^>]*?)?\s*/?>(?:\s*</list_dir>)?)",
+    r"|(?P<ls><list_dir(?P<ls_attrs>\s+[^>]*?)?\s*/?>(?:\s*</list_dir>)?)"
+    r"|(?P<view><view_image\s+(?P<view_attrs>[^>]*?)/?>(?:\s*</view_image>)?)",
     re.DOTALL | re.IGNORECASE,
 )
-OPEN_TAG_PATTERN = re.compile(r"<(?:write_file|replace_in_file|run_command|search_web|read_file|list_dir)\b", re.IGNORECASE)
+OPEN_TAG_PATTERN = re.compile(r"<(?:write_file|replace_in_file|run_command|search_web|read_file|list_dir|view_image)\b", re.IGNORECASE)
 COMPLETE_PATTERN = re.compile(r"<status>\s*COMPLETE\s*</status>", re.IGNORECASE)
 
 
@@ -781,6 +950,8 @@ def parse_tool_calls(text: str) -> tuple[list[tuple[str, dict]], bool]:
             calls.append(("read_file", {"path": _attr(attrs, "path") or "", "lines": _attr(attrs, "lines")}))
         elif m.group("ls"):
             calls.append(("list_dir", {"path": _attr(m.group("ls_attrs"), "path") or "."}))
+        elif m.group("view"):
+            calls.append(("view_image", {"path": _attr(m.group("view_attrs"), "path") or ""}))
     leftover = TOOL_PATTERN.sub("", text)
     return calls, bool(OPEN_TAG_PATTERN.search(leftover))
 
@@ -824,6 +995,8 @@ def dispatch_tool(state: TaskState, kind: str, a: dict) -> tuple[str, str, str]:
     if kind == "list_dir":
         return (f"list_dir('{a['path']}')", execute_list_dir(state, a["path"]), a["path"])
     state.tool_calls += 1
+    if kind == "view_image":
+        return (f"view_image('{a['path']}')", execute_view_image(state, a["path"]), a["path"])
     return ("search_web", execute_search_web(a["query"]), a["query"])
 
 
@@ -888,6 +1061,14 @@ def build_system_prompt(state: TaskState) -> str:
         + ("11. End EVERY reply with <turns_left>N</turns_left>: your honest estimate of how many more turns you need to "
            "finish and pass the acceptance checks (0 when done). The harness may extend your turn budget based on it, but "
            "only while your estimates keep shrinking, so be accurate and do not inflate it.\n" if CFG.ask_turns_left else "")
+        + ("12. When a change affects how something LOOKS, make a screenshot (for example with --screenshot) and look at it with "
+           "<view_image>. Describe what you see, compare it with the task, and fix visible problems before you complete.\n"
+           if vision_enabled() else "")
+        + ("13. Your hidden reasoning is thrown away after every turn; only your visible reply is remembered, and old turns "
+           "are trimmed. Begin EVERY reply with up to two short lines: `LEARNED: <a new fact you just found, with file and line "
+           "numbers>` and `PLAN: <your current theory and your next 2-3 steps>`. The harness keeps these lines for you, so you never "
+           "have to re-read or re-think what you already worked out. Read files in big pieces (up to about 250 lines at once), "
+           "not tiny chunks.\n")
         + "\n"
         "Tools (XML tags):\n"
         "- <write_file path=\"relative/path.py\">full file contents</write_file>  (create or overwrite)\n"
@@ -897,7 +1078,9 @@ def build_system_prompt(state: TaskState) -> str:
         "- <list_dir path=\".\"/>\n"
         "- <run_command>bash command</run_command>\n"
         "- <search_web>query</search_web>\n"
-        "- <status>COMPLETE</status>\n\n"
+        + ("- <view_image path=\"shot.png\"/>  (look at a PNG or JPG; it is shown to you with your next turn)\n"
+           if vision_enabled() else "")
+        + "- <status>COMPLETE</status>\n\n"
         "Prefer replace_in_file over rewriting whole files, and read_file over cat. "
         "Execute your tools immediately and mark complete only when fully verified."
     )
@@ -948,14 +1131,52 @@ def trim_history(history: list[dict]) -> list[dict]:
     def total() -> int:
         return sum(len(m["content"]) for m in history)
 
-    while total() > history_budget_chars() and len(history) > 4:
+    budget = history_budget_chars()
+    if total() <= budget:
+        return dropped
+    target = int(budget * 0.7)      # trim once, well below the limit: the prompt prefix then stays cacheable for many turns
+    while total() > target and len(history) > 4:
         dropped.extend(history[2:4])
         del history[2:4]
     return dropped
 
 
-def summarize_dropped(dropped: list[dict], notes: str) -> str:
-    """Compress trimmed turns into a short running summary using the fast model."""
+def mechanical_notes(dropped: list[dict], notes: str) -> str:
+    """Deterministic progress notes built from the trimmed turns, used when the small model is unavailable:
+    files written or edited, the last commands run, and the last FAIL lines from any acceptance checker."""
+    files: list[str] = []
+    cmds: list[str] = []
+    fails: list[str] = []
+    for m in dropped:
+        text = m["content"]
+        if m["role"] == "assistant":
+            files += re.findall(r"<(?:write_file|replace_in_file) path=[\"']([^\"']+)[\"']", text)
+            cmds += [re.sub(r"\s+", " ", c).strip()[:100] for c in re.findall(r"<run_command>(.*?)</run_command>", text, re.DOTALL)]
+        else:
+            fails += [re.sub(r"\s+", " ", f)[:110] for f in re.findall(r"^FAIL\s+(.+)$", text, re.MULTILINE)]
+
+    def uniq(items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        return [i for i in items if not (i in seen or seen.add(i))]
+
+    lines = []
+    if files:
+        lines.append("- Files written or edited in the trimmed turns: " + ", ".join(uniq(files)[-15:]))
+    if cmds:
+        lines.append("- Last commands run: " + " | ".join(cmds[-5:]))
+    if fails:
+        lines.append("- Last checker FAIL lines seen: " + "; ".join(uniq(fails)[-8:]))
+    lines.append(f"- {len(dropped) // 2} older turns were trimmed. Use list_dir/read_file to see the current files; "
+                 "re-run the acceptance checker to see what still fails.")
+    merged = ((notes + "\n") if notes else "") + "\n".join(lines)
+    return merged[-CFG.max_notes_chars:]
+
+
+def summarize_dropped(dropped: list[dict], notes: str, state: Optional[TaskState] = None) -> str:
+    """Compress trimmed turns into a short running summary using the fast model; if it is down or slow, fall back to
+    deterministic notes, and stop asking it after two failures in a row so a sick small model costs no more time."""
+    if state is not None and state.summarizer_failures >= 2:
+        return mechanical_notes(dropped, notes)
     chunks: list[str] = []
     budget = max(int((CFG.fast_num_ctx - 1500) * 2.8), 4000)   # chars; keeps the prompt inside fast_num_ctx
     for m in reversed(dropped):                                  # newest turns matter most
@@ -978,12 +1199,16 @@ def summarize_dropped(dropped: list[dict], notes: str) -> str:
                                keep_alive=CFG.fast_keep_alive)
         text = res["message"]["content"].strip()
         if text:
+            if state is not None:
+                state.summarizer_failures = 0
             return text[:CFG.max_notes_chars]
     except Exception as e:
-        print(f"[⚠️ Warning] History summarizer unavailable: {e}")
-    fallback = f"{notes}\n- {len(dropped) // 2} older turns were trimmed (summary unavailable)." if notes else \
-        f"- {len(dropped) // 2} older turns were trimmed (summary unavailable); check files with list_dir/read_file."
-    return fallback[-CFG.max_notes_chars:]
+        print(f"[⚠️ Warning] History summarizer unavailable: {e}; using mechanical notes instead.")
+    if state is not None:
+        state.summarizer_failures += 1
+        if state.summarizer_failures >= 2:
+            print("[⚠️ Warning] The small model failed twice in a row; mechanical notes will be used for the rest of this task.")
+    return mechanical_notes(dropped, notes)
 
 
 @dataclass
@@ -997,6 +1222,7 @@ class ModelReply:
     gen_seconds: float = 0.0
     load_seconds: float = 0.0
     error: str = ""
+    images_dropped: bool = False           # the model refused the attached image(s); vision was switched off
 
 
 def choose_think(state: TaskState, iteration: int):
@@ -1040,6 +1266,7 @@ def heavy_chat(messages: list[dict], options: dict, think=None):
 def query_heavy_model(history: list[dict], think=None) -> ModelReply:
     options = {"num_predict": CFG.num_predict, "num_ctx": CFG.num_ctx, "temperature": CFG.temperature}
     last_err = ""
+    images_dropped = False
     for attempt in range(1, CFG.model_retries + 1):
         try:
             print(f"[*] Querying {CFG.heavy_model} (Attempt {attempt}/{CFG.model_retries})...")
@@ -1054,9 +1281,16 @@ def query_heavy_model(history: list[dict], think=None) -> ModelReply:
                 gen_tokens=int(_field(res, "eval_count", 0) or 0),
                 gen_seconds=int(_field(res, "eval_duration", 0) or 0) / 1e9,
                 load_seconds=int(_field(res, "load_duration", 0) or 0) / 1e9,
+                images_dropped=images_dropped,
             )
         except Exception as e:
             last_err = str(e)
+            if any(m.get("images") for m in history) and "image" in last_err.lower():
+                CFG.vision_supported = False
+                history = [{k: v for k, v in m.items() if k != "images"} for m in history]
+                images_dropped = True
+                print(f"[⚠️ Warning] {CFG.heavy_model} refused the image ({e}); image viewing is switched off.")
+                continue
             print(f"[⚠️ Warning] Attempt {attempt} failed: {e}")
             time.sleep(10)
     return ModelReply(content=None, error=last_err)
@@ -1186,6 +1420,13 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
         return False, "Task file has no goal text.", transcript
 
     state = new_task_state(task_name, workdir)
+    missing = [f for f in parse_required_files(raw) if not ctest("-f", posixpath.join(state.container_dir, f))]
+    if missing:
+        reason = (f"Required file(s) missing from {state.container_dir}: {', '.join(missing)}. "
+                  "Copy them into that folder and queue the task again.")
+        print(f"[!] {reason}")
+        state.events.emit("task_start_refused", missing=missing)
+        return False, reason, transcript
     state.verify_cmds = verify_cmds
     state.preexisting_files = container_dir_has_files(state.container_dir)
     state.base_prompt = build_task_prompt(state, goal)
@@ -1234,11 +1475,177 @@ def budget_note(state: TaskState, iteration: int, limit: int) -> str:
     return "\n\n".join(parts)
 
 
-def maybe_extend_budget(state: TaskState, iteration: int, limit: int) -> tuple[int, str]:
+def recent_estimate(state: TaskState, iteration: int, within: int = 3) -> bool:
+    return any(t >= iteration - within for t, _ in state.estimates)
+
+
+def ask_turns_left(state: TaskState, history: list[dict], iteration: int, limit: int) -> Optional[int]:
+    """Ask the model directly how many more turns it needs. It is a SMALL separate conversation (status summary plus the
+    question), not the 50k-token tool loop, so the model answers instead of calling another tool. Thinking off; nothing is
+    stored in the history."""
+    if not CFG.ask_turns_left:
+        return None
+    question = (f"BUDGET CHECK: you have used {iteration} of {limit} turns and the task is not complete yet. Answer ONLY with "
+                "<turns_left>N</turns_left>, your honest estimate of how many more turns you need to finish and pass all "
+                "acceptance checks, followed by one short line saying what is still left. Do not call any tools.")
+    last_assistant = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+    failing = sorted(state.fail_log[-1][1]) if state.fail_log else []
+    status = (f"TASK (start of the brief): {state.base_prompt[:700]}\n\nPROGRESS NOTES: {state.notes[:700] or '(none)'}\n\n"
+              f"{render_kept_notes(state)[:1200] or '(no kept notes)'}\n\nCHECKS FAILING IN THE LAST CHECKER RUN: {failing or 'unknown'}\n\n"
+              f"YOUR LAST MESSAGE: {last_assistant[:400]}\n\nLAST TOOL RESULT: {history[-1]['content'][:800]}")
+    messages = [{"role": "system", "content": "You answer budget questions about an unfinished engineering task. Reply with exactly "
+                                              "<turns_left>N</turns_left> (a whole number) and then one short line. Never call tools."},
+                {"role": "user", "content": status + "\n\n" + question}]
+    state.last_ask_turn = iteration
+    print(f"[budget] asking the model how many turns it still needs (turn {iteration} of {limit})...")
+    try:
+        res = heavy_chat(messages, {"num_predict": 300, "num_ctx": CFG.num_ctx, "temperature": CFG.temperature}, think=False)
+        answer = strip_thinking(res["message"]["content"] or "")
+    except Exception as e:
+        print(f"[⚠️ Warning] Could not ask for a turn estimate: {e}")
+        log_to_transcript(state, f"=== Budget check at turn {iteration} of {limit} (harness asked the model) ===\nThe question could not be asked: {e}")
+        return None
+    est = parse_turns_left(answer)
+    log_to_transcript(state, f"=== Budget check at turn {iteration} of {limit} (harness asked the model) ===\n"
+                             f"Question: {question}\nAnswer: {answer or '(empty)'}\nUnderstood estimate: {est if est is not None else 'none'}")
+    state.events.emit("turns_left_asked", turn=iteration, estimate=est, answer=answer[:200])
+    if est is None:
+        print(f"[budget] no usable answer: {answer[:120]!r}")
+        return None
+    state.estimates.append((iteration, est))
+    state.events.emit("turns_left_estimate", turn=iteration, estimate=est, limit=limit, asked=True)
+    print(f"[budget] the model says it needs {est} more turns: {answer.replace(chr(10), ' ')[:160]}")
+    return est
+
+
+def record_kept_notes(state: TaskState, text: str, iteration: int = 0) -> None:
+    """The hidden reasoning is discarded after every turn and old turns are trimmed, so keep the model's own short
+    LEARNED:/PLAN: lines from its visible reply and show them to it again on every turn."""
+    for m in re.finditer(r"^\s*(LEARNED|PLAN)\s*:\s*(.+)$", text, re.IGNORECASE | re.MULTILINE):
+        kind, body = m.group(1).upper(), m.group(2).strip()[:240]
+        if iteration:
+            state.last_self_notes_turn = iteration
+        if kind == "PLAN":
+            state.plan = body
+        elif body not in state.learned:
+            state.learned.append(body)
+            del state.learned[:-40]
+
+
+def render_kept_notes(state: TaskState) -> str:
+    parts = []
+    if state.status_block:
+        parts.append(state.status_block)
+    if state.learned:
+        parts.append("LEARNED so far (kept even when old turns are trimmed):\n" + "\n".join(f"- {x}" for x in state.learned[-25:]))
+    if state.plan:
+        parts.append(f"YOUR LATEST PLAN: {state.plan}")
+    return "\n".join(parts)
+
+
+def consolidate_notes(state: TaskState, history: list[dict], iteration: int) -> None:
+    """The model does not write its own LEARNED:/PLAN: lines, so ask it to, in a small separate call, from its latest turns."""
+    recent = []
+    for m in history[-8:]:
+        recent.append(f"[{m['role']}] {m['content'][:260 if m['role'] == 'assistant' else 600]}")
+    failing = sorted(state.fail_log[-1][1]) if state.fail_log else []
+    prompt = (f"TASK (start of the brief): {state.base_prompt[:600]}\n\nNOTES SO FAR:\n{render_kept_notes(state) or '(none)'}\n\n"
+              f"{state.status_block or ''}\n\nCHECKS FAILING IN THE LAST CHECKER RUN: {failing or 'unknown'}\n\nTHE LAST TURNS:\n" + "\n".join(recent)
+              + "\n\nWrite the progress notes now.")
+    messages = [{"role": "system", "content": "You write short progress notes for an unfinished engineering task, from its latest turns. "
+                                              "State ONLY facts that appear in the text you are given and NEVER guess causes. If an AUTHORITATIVE STATUS shows an "
+                                              "error message, your first LEARNED line must quote it exactly with its file and line. Output ONLY: up to 4 lines "
+                                              "starting with `LEARNED:` (one concrete fact each) and exactly one line starting with `PLAN:` (the next 2-3 "
+                                              "concrete steps; if there is a crash, the first step is to run the game and fix that error). No other text, "
+                                              "no tool calls."},
+                {"role": "user", "content": prompt}]
+    state.last_notes_turn = iteration
+    try:
+        res = heavy_chat(messages, {"num_predict": 400, "num_ctx": CFG.num_ctx, "temperature": CFG.temperature}, think=False)
+        answer = strip_thinking(res["message"]["content"] or "")
+    except Exception as e:
+        print(f"[⚠️ Warning] Could not write progress notes: {e}")
+        return
+    record_kept_notes(state, answer)
+    log_to_transcript(state, f"=== Notes written by the harness at turn {iteration} (the model had not kept any) ===\n{answer or '(empty)'}")
+    state.events.emit("notes_consolidated", turn=iteration, learned=len(state.learned))
+    print(f"[notes] {len(state.learned)} facts kept; plan: {state.plan[:120]}")
+
+
+FRAME_RE = re.compile(r"(?:\[at |<- )([^\s:\]<]+\.py):(\d+) in ")
+
+
+def source_snippets(state: TaskState, failure: str, limit: int = 2) -> str:
+    """For a crash like `NameError ... [at tamagotchi/main.py:60 in __init__]`, show the lines around it, so the model sees the
+    exact code instead of having to guess where to look."""
+    seen, blocks = set(), []
+    for path, line in FRAME_RE.findall(failure):
+        if (path, line) in seen or path.startswith("/") or len(blocks) >= limit:
+            continue
+        seen.add((path, line))
+        try:
+            abs_path, rel = resolve_container_path(state, path)
+        except ValueError:
+            continue
+        text, _ = container_read(abs_path)
+        if text is None:
+            continue
+        lines, n = text.splitlines(), int(line)
+        lo, hi = max(1, n - 3), min(len(lines), n + 2)
+        blocks.append(f"SOURCE around {rel}:{n}:\n" + "\n".join(f"{'>' if i == n else ' '} {i:>4} | {lines[i - 1]}" for i in range(lo, hi + 1)))
+    return "\n".join(blocks)
+
+
+def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
+    """Run the acceptance checks ourselves, whatever the model printed or piped through tail/grep, and tell it the exact result.
+    Returns a success reason if everything passes and nothing blocks completion."""
+    state.last_status_turn = iteration
+    failure = run_acceptance_checks(state)
+    if failure is None:
+        state.status_block = ""
+        if completion_blocker(state) is None:
+            state.events.emit("auto_completed", why="periodic status check")
+            log_to_transcript(state, f"=== Status check at turn {iteration} ===\nAll acceptance checks pass: completing the task.")
+            print("[✓] All acceptance checks pass (periodic status check); completing the task.")
+            return "Completed automatically: all acceptance checks pass (periodic status check)"
+        state.pending_note = ("STATUS CHECK (run by the harness): all acceptance checks pass right now, but your last command failed or "
+                              "you changed files since. Run the checks once more and, if they still pass, finish.")
+        return None
+    plateau = update_plateau(state, iteration, [failure])
+    pairs = [(n.strip(), r.strip()) for n, r in re.findall(r"^FAIL\s+(.+?)\s+->\s+(.*)$", failure, re.MULTILINE)]
+    reasons = [f"{n} -> {r[:300 if k < 3 else 140]}" for k, (n, r) in enumerate(pairs[:8])]
+    body = "\n".join(f"- {r}" for r in reasons) if reasons else failure[:900]
+    crash = any("runs without crashing" in n or re.search(r"Error|Traceback", r) for n, r in pairs)
+    extra = []
+    snippets = source_snippets(state, failure)
+    if snippets:
+        extra.append(snippets)
+    if crash:
+        extra.append("A crash comes first: nothing else can pass until the game starts. Reproduce it yourself with "
+                     "`python3 tamagotchi/main.py --frames 5 2>&1 | tail -20`, open the file and line named in the error, and fix THAT.")
+    names = frozenset(n for n, _ in pairs)
+    state.status_history.append(names)
+    last3 = state.status_history[-3:]
+    stuck = ""
+    if len(last3) == 3 and names and last3[0] == last3[1] == last3[2]:
+        stuck = (f"The same {len(names)} check(s) have failed at the last 3 status checks (about {3 * CFG.status_every} turns). Your current approach "
+                 "is not working. Stop reading and theorizing: run the failing thing, read its first error line, and change code.")
+    state.status_block = (f"AUTHORITATIVE STATUS (acceptance checks run by the harness at turn {iteration}; this is newer and more reliable than "
+                          f"anything you remember or wrote in older notes):\n{body}" + ("\n" + "\n".join(extra) if extra else "") + (f"\n{stuck}" if stuck else ""))
+    state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + (plateau or "")
+    log_to_transcript(state, f"=== Status check at turn {iteration} ===\n{state.status_block}")
+    state.events.emit("status_check", turn=iteration, failing=len(reasons))
+    return None
+
+
+def maybe_extend_budget(state: TaskState, iteration: int, limit: int,
+                        history: Optional[list[dict]] = None) -> tuple[int, str]:
     """The turn budget is used up. Extend it only if the model's own estimate says it is close AND its
     estimates have been shrinking. Returns (new_limit, reason_if_not_extended)."""
     if not CFG.ask_turns_left:
         return limit, ""
+    if history is not None and not recent_estimate(state, iteration):
+        ask_turns_left(state, history, iteration, limit)
     if not state.estimates:
         return limit, "The model never reported <turns_left>, so the budget was not extended."
     if state.extensions >= CFG.max_extensions:
@@ -1262,34 +1669,82 @@ def maybe_extend_budget(state: TaskState, iteration: int, limit: int) -> tuple[i
     return new_limit, ""
 
 
+def try_auto_complete(state: TaskState, why: str) -> Optional[str]:
+    """The harness's own verdict: if the task has acceptance checks, nothing blocks completion and ALL of them pass,
+    the task is done, whether or not the model remembered to say so. Returns a success reason, else None."""
+    if not (CFG.auto_complete and state.verify_cmds):
+        return None
+    if completion_blocker(state) is not None:
+        return None
+    failure = run_acceptance_checks(state)
+    if failure is not None:
+        log_to_transcript(state, f"=== Harness ran the acceptance checks ({why}) ===\nNot passing yet:\n{failure[:1500]}")
+        state.pending_note = f"The harness ran all acceptance checks ({why}) and this failed:\n{failure[:1500]}"
+        state.events.emit("auto_complete_failed", why=why)
+        print(f"[*] Acceptance checks run by the harness ({why}): not passing yet.")
+        return None
+    state.events.emit("auto_completed", why=why)
+    log_to_transcript(state, f"=== Harness ran the acceptance checks ({why}) ===\nAll checks pass: completing the task.")
+    print(f"[✓] All acceptance checks pass ({why}); completing the task.")
+    return f"Completed automatically: all acceptance checks pass ({why})"
+
+
 def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) -> tuple[bool, str]:
+    state.transcript = transcript
     limit = CFG.max_iterations
     iteration = 0
     while True:
         iteration += 1
         if iteration > limit:
-            limit, why = maybe_extend_budget(state, iteration - 1, limit)
+            done = try_auto_complete(state, "the turn budget was reached")
+            if done:
+                transcript.append(f"=== Auto-complete ===\n{done}")
+                return True, done
+            before = limit
+            limit, why = maybe_extend_budget(state, iteration - 1, limit, history)
+            log_to_transcript(state, f"=== Budget decision at turn {iteration - 1} ===\n" +
+                              (f"Extended the turn budget from {before} to {limit}." if limit > before else f"Not extended: {why}"))
             if iteration > limit:
                 last = f" Its last estimate was {state.estimates[-1][1]} more turns." if state.estimates else ""
                 return False, f"Reached the {limit}-turn budget without completing.{last} {why}".strip()
         print(f"\n--- Autonomous Agent Turn {iteration} of {limit} ---")
+        if (CFG.ask_turns_left and limit >= 10 and limit - iteration + 1 <= 5 and iteration - state.last_ask_turn >= 5
+                and not recent_estimate(state, iteration)):
+            ask_turns_left(state, history, iteration, limit)
+        if CFG.notes_every and iteration - max(state.last_self_notes_turn, state.last_notes_turn) > CFG.notes_every:
+            consolidate_notes(state, history, iteration)
+        if (state.estimates and state.estimates[-1][1] == 0 and state.estimates[-1][0] >= iteration - 3
+                and state.zero_checked_turn != state.estimates[-1][0]):
+            state.zero_checked_turn = state.estimates[-1][0]
+            done = try_auto_complete(state, "the model reported 0 turns left")
+            if done:
+                transcript.append(f"=== Auto-complete ===\n{done}")
+                return True, done
 
         dropped = trim_history(history)
         if dropped:
-            state.notes = summarize_dropped(dropped, state.notes)
+            state.notes = summarize_dropped(dropped, state.notes, state)
             history[1]["content"] = render_task_message(state)
             state.events.emit("history_trimmed", dropped=len(dropped), notes_chars=len(state.notes))
 
         think = choose_think(state, iteration)
         t0 = time.monotonic()
-        note = budget_note(state, iteration, limit)
+        note = "\n\n".join(p for p in (render_kept_notes(state), budget_note(state, iteration, limit)) if p)
         view = history if not note else history[:-1] + [{"role": history[-1]["role"],
                                                          "content": history[-1]["content"] + "\n\n" + note}]
+        if state.pending_images:
+            view = view[:-1] + [dict(view[-1], images=list(state.pending_images))]
+            state.pending_images = []
+            state.events.emit("image_sent", turn=iteration)
         reply = query_heavy_model(view, think)
         model_seconds = time.monotonic() - t0
         if reply.content is None:
             state.events.emit("model_failure", error=reply.error)
             return False, f"Persistent model failure: {reply.error}"
+        if reply.images_dropped:
+            state.pending_note = ("The model could not accept the image, so image viewing is now disabled. Verify how things "
+                                  "look with the structural checks instead.")
+            state.events.emit("vision_disabled", turn=iteration)
         response, hit_limit = reply.content, reply.hit_limit
         inline_think = len(response) - len(re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL | re.IGNORECASE))
         think_chars = reply.thinking_chars + inline_think
@@ -1303,6 +1758,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         clean = strip_thinking(response)
         history.append({"role": "assistant", "content": clean or "(no output)"})
 
+        record_kept_notes(state, clean, iteration)
         est = parse_turns_left(clean) if CFG.ask_turns_left else None
         if est is not None:
             state.estimates.append((iteration, est))
@@ -1365,10 +1821,15 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         outputs: list[str] = []
         nudges: list[str] = []
         worst = 0
+        green = False
         for kind, args in calls:
             t1 = time.monotonic()
             label, out, arg_key = dispatch_tool(state, kind, args)
             outputs.append(f"Tool {label} Output:\n{out}")
+            if (kind == "run_command" and CFG.auto_complete and state.verify_cmds and state.last_exit_code == 0
+                    and not state.hidden_error and not re.search(r"^FAIL\b", out, re.MULTILINE)
+                    and any(v in args["cmd"] for v in state.verify_cmds)):
+                green = True
             state.events.emit("tool", turn=iteration, kind=kind, label=label,
                               seconds=round(time.monotonic() - t1, 1),
                               exit_code=state.last_exit_code if kind == "run_command" else None,
@@ -1389,7 +1850,31 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs))
             return False, f"Stuck: the same action produced the same result {worst} times."
 
+        if CFG.status_every and state.verify_cmds and iteration - state.last_status_turn >= CFG.status_every and not wants_complete:
+            done = periodic_status(state, iteration)
+            if done:
+                transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
+                return True, done
+        if all(kind in ("read_file", "list_dir", "view_image") for kind, _ in calls):
+            state.readonly_streak += 1
+        else:
+            state.readonly_streak = 0
+        if state.readonly_streak >= CFG.readonly_nudge and iteration - state.last_readonly_nudge >= CFG.readonly_nudge:
+            state.last_readonly_nudge = iteration
+            state.events.emit("readonly_nudge", turn=iteration, streak=state.readonly_streak)
+            text = (f"NUDGE: you have only READ files for {state.readonly_streak} turns in a row (no command run, no edit). Reading more will not find the "
+                    "bug. RUN something now: the game (`python3 tamagotchi/main.py --frames 5 2>&1 | tail -20`) or the checker, read the FIRST error "
+                    "line, open exactly the file and line it names, and fix it.")
+            log_to_transcript(state, f"=== Read-only nudge at turn {iteration} ===\n{text}")
+            state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + text
         notes = list(nudges)
+        auto_note = maybe_auto_attach_image(state, iteration, outputs)
+        if auto_note:
+            notes.append(auto_note)
+        plateau_note = update_plateau(state, iteration, outputs)
+        if plateau_note:
+            log_to_transcript(state, f"=== Plateau nudge at turn {iteration} ===\n{plateau_note}")
+            state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + plateau_note
         if salvaged:
             notes.append("NOTE: Your reply used markdown code blocks instead of tool tags, which the harness cannot execute. "
                          f"I saved these files for you this time: {', '.join(salvaged)}. From now on use <write_file> and "
@@ -1404,6 +1889,12 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         committed = git_checkpoint(state, f"turn {iteration}")
         if committed:
             state.events.emit("checkpoint", turn=iteration)
+
+        if green and not wants_complete:
+            done = try_auto_complete(state, "after you ran an acceptance command successfully")
+            if done:
+                transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
+                return True, done
 
         combined = "\n\n".join(outputs + notes)
         transcript.append(f"=== Turn {iteration}: tool results ===\n{combined}")
@@ -1524,6 +2015,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-ctx", action="store_true", help="find the largest context that stays fully in VRAM, then exit")
     p.add_argument("--hard-max-iterations", type=int, help="absolute turn ceiling, extensions included")
     p.add_argument("--max-extensions", type=int, help="how many times the turn budget may be extended")
+    p.add_argument("--vision", choices=["auto", "on", "off"], help="let the model look at screenshots with <view_image> (default auto)")
+    p.add_argument("--no-auto-complete", action="store_true",
+                   help="never finish a task on the harness's own verdict; require the model to say <status>COMPLETE</status>")
     p.add_argument("--no-turn-estimates", action="store_true",
                    help="do not ask the model for <turns_left> and never extend the turn budget")
     p.add_argument("--temperature", type=float)
@@ -1547,6 +2041,9 @@ def apply_args(args: argparse.Namespace) -> None:
     if args.think:
         CFG.think = args.think
     CFG.ask_turns_left = not args.no_turn_estimates
+    CFG.auto_complete = not args.no_auto_complete
+    if args.vision:
+        CFG.vision = args.vision
     CFG.enable_internet = args.enable_internet
     CFG.use_llm_auditor = not args.no_auditor
     CFG.isolate_tasks = not args.no_isolate
@@ -1563,6 +2060,7 @@ def main() -> None:
         probe_context()
         return
     init_runtime()
+    detect_vision()
     ensure_sandbox_running()
     recover_interrupted()
     try:
