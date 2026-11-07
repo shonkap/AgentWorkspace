@@ -1,0 +1,31 @@
+WORKDIR: office-game
+REQUIRE: refactor_check.py
+PROTECT: refactor_check.py
+PROTECT: refactor_baseline_fails.txt
+PROTECT: ref_shot.png
+PROTECT: ref_shot_walk.png
+PROTECT: check_office2.py
+PROTECT: quick_check.py
+PROTECT: perf_check.py
+PROTECT: economy_ref.py
+PROTECT: test_economy_ref.py
+QUICKCHECK: python3 tamagotchi/main.py --frames 20 && python3 tamagotchi/main.py --script right:10,e:1,esc:1,down:5 --frames 40 && python3 refactor_check.py --sizes
+
+REFACTORING TASK for the game in tamagotchi/ (only that folder is the live game). tamagotchi/main.py has grown to
+517 lines, which is too big to edit safely. Split it into modules WITHOUT changing behavior:
+ - tamagotchi/input_router.py: everything that turns key presses into actions (the script phases parsing, the
+   held/pressed key sets for live play and --script, and the routing of keys to the pause menu, help overlay, office
+   menu or movement). Give it a small API, e.g. `read_input(...) -> (held, pressed)` and `route_keys(game, held, pressed)`.
+ - tamagotchi/render.py: drawing of the world, furniture, characters and the frame composition.
+ - tamagotchi/hud.py: the HUD drawing and the "hud" rectangles for the state dump.
+ - main.py keeps argument parsing, setup, the main loop and the state dump, and must end up at most 250 lines.
+Every new module at most 300 lines. Move code in small steps: create a new module with write_file containing the
+moved functions, change main.py to import them, delete the moved code from main.py with replace_in_file, run the quick
+checks, repeat. Do NOT try to fix the failing gameplay checks in this task; just keep them exactly as they are.
+
+The ORIGINAL main.py from before the split is in git: `git show 9103edc:tamagotchi/main.py` (compare with it when behavior or pixels differ: the split must not change anything).
+Run `python3 refactor_check.py` before you finish: no NEW check_office2 failures, both screenshots identical, sizes OK.
+
+VERIFY: python3 refactor_check.py
+VERIFY: python3 -m unittest discover -s tamagotchi -p "test_*.py"
+VERIFY: python3 perf_check.py 3.0
