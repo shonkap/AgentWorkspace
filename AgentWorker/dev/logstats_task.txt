@@ -1,0 +1,8 @@
+WORKDIR: logstats
+REQUIRE: SPEC.md
+PROTECT: tests/test_spec.py
+
+The logstats package (parse.py, stats.py, cli.py) is an early draft. Implement SPEC.md completely so that the
+acceptance tests in tests/test_spec.py pass. Do not change the tests.
+
+VERIFY: python3 -m unittest discover -s tests -v

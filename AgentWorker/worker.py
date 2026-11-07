@@ -967,7 +967,7 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
     if state.read_locked and len(new_lines) < 0.5 * len(wanted):
         return READ_LOCK_MSG
     if not new_lines:
-        return (f"{rel} lines {start}-{end} are UNCHANGED since you read them; that result is still in this conversation "
+        return (f"{rel} lines {start}-{max(start, req_end)} are UNCHANGED since you read them; that result is still in this conversation "
                 "above. Do not read them again: use what you already have, and act (edit or run).")
     if rel in state.protected:
         budget = CFG.protected_read_lines - state.protected_lines_read.get(rel, 0)
