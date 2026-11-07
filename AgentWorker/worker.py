@@ -1135,6 +1135,26 @@ def dispatch_tool(state: TaskState, kind: str, a: dict) -> tuple[str, str, str]:
 
 
 # ================= SANDBOX =================
+ORPHAN_SCRIPT = r"""
+for p in /proc/[0-9]*; do
+  pid=${p#/proc/}
+  [ "$pid" = "$$" ] && continue
+  c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
+  case "$c" in "timeout --kill-after="*) echo "$pid $c"; kill -TERM "$pid" 2>/dev/null; kill -TERM -"$pid" 2>/dev/null;; esac
+done
+"""
+
+
+def kill_orphans() -> None:
+    """Commands from a worker that was killed keep running inside the container (docker exec does not stop them) and would
+    compete with the new run for CPU. Every harness command runs under `timeout --kill-after=...`, so stop those."""
+    try:
+        _, out = cexec(["bash", "-c", ORPHAN_SCRIPT])
+    except Exception:
+        return
+    if out.strip():
+        print(f"[*] Stopped {len(out.strip().splitlines())} leftover command(s) from an earlier worker run:\n{out.strip()[:500]}")
+
 def ensure_sandbox_running() -> None:
     print("[*] Checking sandbox container status...")
     container = None
@@ -1161,6 +1181,7 @@ def ensure_sandbox_running() -> None:
         )
         print(f"[✓] Container '{CFG.container_name}' is ready.")
     check_sandbox_tools()
+    kill_orphans()
     # Task dirs are chown'd to the host user when a task ends, so root-in-container git would
     # otherwise refuse them as "dubious ownership" on the next attempt (PlatformIO also uses git).
     try:
@@ -1867,6 +1888,21 @@ def maybe_extend_budget(state: TaskState, iteration: int, limit: int,
     return new_limit, ""
 
 
+def checks_cheap_or_cached(state: TaskState) -> bool:
+    """True if running all acceptance checks now costs little: each one is either cached for the current files or was
+    measured as quick. A trivial green command must not launch a 7-minute checker on every turn."""
+    fp = None
+    for v in state.verify_cmds:
+        key = fix_command_paths(v).strip()
+        if state.verify_seconds.get(key, 9999) <= max(CFG.auto_verify_seconds, 30):
+            continue
+        cached = state.verify_cache.get(key)
+        fp = fp or workdir_fingerprint(state)
+        if not (cached and cached[0] == fp):
+            return False
+    return True
+
+
 def try_auto_complete(state: TaskState, why: str) -> Optional[str]:
     """The harness's own verdict: if the task has acceptance checks, nothing blocks completion and ALL of them pass,
     the task is done, whether or not the model remembered to say so. Returns a success reason, else None."""
@@ -2118,7 +2154,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         if committed:
             state.events.emit("checkpoint", turn=iteration)
 
-        if green and not wants_complete:
+        if green and not wants_complete and checks_cheap_or_cached(state):
             done = try_auto_complete(state, "after you ran an acceptance command successfully")
             if done:
                 transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
