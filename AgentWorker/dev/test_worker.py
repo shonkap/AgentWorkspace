@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Unit/scenario tests for worker.py with a fake sandbox (local subprocesses in a temp dir standing in for /workspace)
+and a scripted fake model. Run: ./venv/bin/python dev/test_worker.py   (from AgentWorker/)"""
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+import worker as W  # noqa: E402
+
+
+class FakeContainer:
+    def __init__(self, root):
+        self.root = root
+
+    def put_archive(self, directory, data):
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            tar.extractall(self.root + directory, filter="data")
+        return True
+
+    def exec_run(self, cmd, workdir=None, environment=None):
+        raise AssertionError("not used")
+
+
+class Sandbox:
+    """Maps container paths (/workspace/...) to a temp dir by rewriting absolute paths in argv."""
+
+    def __init__(self):
+        self.tmp = tempfile.mkdtemp()
+        os.makedirs(self.tmp + "/workspace", exist_ok=True)
+
+    def map(self, s):
+        return s.replace("/workspace", self.tmp + "/workspace") if isinstance(s, str) else s
+
+    def cexec(self, args, workdir=None, timeout=None, env=None):
+        args = [self.map(a) for a in args]
+        if args and args[0] == "git":
+            return 1, "no git in tests"
+        p = subprocess.run(args, cwd=self.map(workdir) if workdir else None, capture_output=True, text=True,
+                           env={**os.environ, **(env or {})}, timeout=timeout or 60)
+        out = (p.stdout + p.stderr).replace(self.tmp, "")
+        return p.returncode, out
+
+
+class FakeModel:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.seen = []
+
+    def __call__(self, messages, options, think=None):
+        self.seen.append([dict(m) for m in messages])
+        if messages and messages[0]["role"] == "system" and "budget questions" in messages[0]["content"]:
+            return {"message": {"content": "<turns_left>3</turns_left> almost"}}
+        if messages and messages[0]["role"] == "system" and "progress notes" in messages[0]["content"]:
+            return {"message": {"content": "LEARNED: x\nPLAN: y"}}
+        reply = self.replies.pop(0) if self.replies else "<list_dir/>"
+        return {"message": {"content": reply}, "done_reason": "stop", "eval_count": 10, "eval_duration": 1e8}
+
+
+def make_env(test, files, replies, **cfg):
+    sb = Sandbox()
+    test.addCleanup(shutil.rmtree, sb.tmp, True)
+    W.CFG.workspace_dir = sb.tmp + "/q"
+    W.CFG.sandbox_dir = sb.tmp + "/workspace"
+    W.CFG.ensure_dirs()
+    W.CFG.use_llm_auditor = False
+    W.CFG.use_git = False
+    W.CFG.fix_ownership = False
+    W.CFG.ask_turns_left = False
+    W.CFG.notes_every = 0
+    for k, v in cfg.items():
+        setattr(W.CFG, k, v)
+    W.cexec = sb.cexec
+    fc = FakeContainer(sb.tmp)
+    W.docker_client = type("D", (), {"containers": type("C", (), {"get": staticmethod(lambda name: fc)})()})()
+    model = FakeModel(replies)
+    W.heavy_chat = model
+    W.fast_client = None
+    for path, text in files.items():
+        full = f"{sb.tmp}/workspace/proj/{path}"
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+    return sb, model
+
+
+def task_file(sb, text):
+    path = f"{sb.tmp}/q/task.txt"
+    with open(path, "w") as f:
+        f.write(text)
+    return path
+
+
+CHECK = """import sys
+v = open('val.txt').read().strip() if __import__('os').path.exists('val.txt') else ''
+for i in range(20): print(f'PASS  check {i}')
+print('PASS  val exists' if v else 'FAIL  val exists  ->  write val.txt')
+ok = v == '42'
+print('PASS  val is 42' if ok else f'FAIL  val is 42  ->  got {v!r}')
+sys.exit(0 if ok else 1)
+"""
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.saved = {k: getattr(W.CFG, k) for k in vars(W.CFG)}
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(W.CFG, k, v)
+
+    def test_compress_output(self):
+        text = "\n".join(["== a =="] + [f"PASS  x{i}" for i in range(30)] + ["FAIL  y  ->  bad"] + ["PASS  z"])
+        out = W.compress_output(text)
+        self.assertIn("FAIL  y  ->  bad", out)
+        self.assertIn("[30 passing line(s) hidden]", out)
+        self.assertNotIn("PASS  x3", out)
+        self.assertEqual(W.compress_output("PASS a\nFAIL b"), "PASS a\nFAIL b")
+        ut = "\n".join([f"test_{i} (m.T.test_{i}) ... ok" for i in range(10)] + ["test_x (m.T) ... FAIL"])
+        self.assertIn("... FAIL", W.compress_output(ut))
+        self.assertIn("10 passing", W.compress_output(ut))
+
+    def test_success_and_auto_verify(self):
+        sb, model = make_env(self, {"check.py": CHECK}, [
+            "PLAN: run\n<run_command>python3 check.py</run_command>",
+            '<write_file path="val.txt">41</write_file>',          # edit-only turn: harness runs the check itself
+            '<write_file path="val.txt">42</write_file>',          # edit-only again: auto-verify passes -> complete
+        ])
+        ok, reason, _ = W.run_task(task_file(sb, "WORKDIR: proj\nPROTECT: check.py\nmake val 42\nVERIFY: python3 check.py"), 1)
+        self.assertTrue(ok, reason)
+        self.assertIn("re-ran the checks", reason)
+        third_prompt = model.seen[2][-1]["content"]
+        self.assertIn("AUTO-CHECK", third_prompt)
+        self.assertIn("got '41'", third_prompt)
+        self.assertNotIn("PASS  check 3", third_prompt)
+
+    def test_protected_file(self):
+        sb, model = make_env(self, {"check.py": CHECK}, [
+            '<write_file path="check.py">print("ALL PASS")</write_file>',
+            "<run_command>echo 'import sys; sys.exit(0)' > check.py</run_command>",
+            "<run_command>cat check.py | head -3</run_command>",
+        ], max_iterations=3, status_every=0)
+        ok, reason, _ = W.run_task(task_file(sb, "WORKDIR: proj\nPROTECT: check.py\nx\nVERIFY: python3 check.py"), 1)
+        self.assertFalse(ok)
+        self.assertIn("REFUSED", model.seen[1][-1]["content"])
+        self.assertIn("restored the originals", model.seen[2][-1]["content"])
+        with open(f"{sb.tmp}/workspace/proj/check.py") as f:
+            self.assertEqual(f.read(), CHECK)
+
+    def test_read_dedup_and_lock(self):
+        sb, model = make_env(self, {"check.py": CHECK, "a.py": "x = 1\n"},
+                             ['<read_file path="a.py"/>'] * 4 + ['<run_command>true</run_command>', '<read_file path="a.py"/>'],
+                             max_iterations=6, status_every=0, readonly_nudge=3)
+        W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
+        self.assertIn("x = 1", model.seen[1][-1]["content"])
+        self.assertIn("UNCHANGED", model.seen[2][-1]["content"])
+        self.assertIn("LOCKED", model.seen[3][-1]["content"])
+        self.assertIn("REFUSED: reading is locked", model.seen[4][-1]["content"])
+        self.assertIn("UNCHANGED", model.seen[6][-1]["content"] if len(model.seen) > 6 else "UNCHANGED")
+
+    def test_status_uses_cache(self):
+        sb, model = make_env(self, {"check.py": CHECK}, ["<run_command>python3 check.py</run_command>"] + ["<list_dir/>"] * 5,
+                             max_iterations=4, status_every=2, auto_verify_seconds=0)
+        events = []
+        orig = W.EventLog.emit
+        W.EventLog.emit = lambda self_, ev, **kw: events.append((ev, kw))
+        self.addCleanup(setattr, W.EventLog, "emit", orig)
+        W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
+        verifies = [kw for ev, kw in events if ev == "verify"]
+        self.assertTrue(verifies and all(kw.get("cached") for kw in verifies), verifies)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

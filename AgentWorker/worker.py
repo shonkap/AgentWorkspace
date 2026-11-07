@@ -80,6 +80,7 @@ class Config:
     auto_view_gap: int = 6                # at least this many turns between automatic attachments
     notes_every: int = 8                  # the harness writes the progress notes itself when the model has not (0 = off)
     status_every: int = 10                # the harness runs the acceptance checks itself every N turns and tells the model the result (0 = off)
+    auto_verify_seconds: float = 90.0     # after an edit-only turn, run the checks for the model if they take at most this long (0 = off)
     readonly_nudge: int = 8               # this many turns of ONLY reading (no command, no edit) triggers a 'run something' nudge
     plateau_turns: int = 15               # the same checks failing for this many turns triggers a 'step back' nudge
     fast_timeout: float = 90.0            # seconds; the small model only does short jobs, so don't wait minutes for it
@@ -231,6 +232,10 @@ class TaskState:
     reads: dict = field(default_factory=dict)            # (rel, lines) -> (content hash, turn) of reads still in the history
     read_locked: bool = False                            # reading is refused until the agent edits or runs something
     iteration: int = 0
+    version: int = 0                                     # bumped by every edit and every non-check command
+    verify_cache: dict = field(default_factory=dict)     # verify cmd -> (version, exit code, output)
+    verify_seconds: dict = field(default_factory=dict)   # verify cmd -> seconds its last run took
+    status_version: int = -1                             # version at the last periodic status check
     last_readonly_nudge: int = 0
     learned: list = field(default_factory=list)          # LEARNED: lines from the model's own replies
     plan: str = ""                                       # its latest PLAN: line
@@ -313,6 +318,7 @@ def restore_protected(state: "TaskState") -> list[str]:
             container_write(abs_path, text)
             restored.append(rel)
     if restored:
+        state.version += 1
         state.events.emit("protected_restored", files=restored)
     return restored
 
@@ -649,11 +655,18 @@ def execute_run_command(state: TaskState, command: str) -> str:
             state.last_exit_code = 1
             return a_msg
 
+    is_check = clean_cmd in [fix_command_paths(v).strip() for v in state.verify_cmds]
+    if not is_check:
+        state.version += 1          # an arbitrary command may change files
+    t0 = time.monotonic()
     try:
         exit_code, output = container_exec(state, clean_cmd)
     except Exception as e:
         state.last_exit_code = 1
         return f"Container execution error: {e}"
+    if is_check:
+        state.verify_cache[clean_cmd] = (state.version, exit_code, output)
+        state.verify_seconds[clean_cmd] = time.monotonic() - t0
 
     state.last_exit_code = exit_code
     if exit_code == 0:
@@ -738,6 +751,7 @@ def execute_write_file(state: TaskState, path: str, content: str) -> str:
         return f"Failed to write file: {err}"
 
     state.unverified_changes = True
+    state.version += 1
     if not text.strip() and posixpath.basename(abs_path) not in EMPTY_FILE_OK:
         return f"ERROR: {state.container_dir}/{rel} was written empty. Provide the file contents."
     return f"Successfully wrote {len(text)} characters to {state.container_dir}/{rel}"
@@ -774,6 +788,7 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
     if err:
         return f"Failed to edit file: {err}"
     state.unverified_changes = True
+    state.version += 1
     return f"Successfully edited {state.container_dir}/{rel} (1 replacement)"
 
 
@@ -1480,13 +1495,22 @@ def completion_blocker(state: TaskState) -> Optional[str]:
 def run_acceptance_checks(state: TaskState) -> Optional[str]:
     """Run the task's VERIFY commands ourselves. Returns None if all pass, else a failure report."""
     for cmd in state.verify_cmds:
-        print(f"[*] Acceptance check: {cmd}")
-        try:
-            code, out = container_exec(state, fix_command_paths(cmd))
-        except Exception as e:
-            state.events.emit("verify", cmd=cmd, error=str(e))
-            return f"ACCEPTANCE CHECK COULD NOT RUN\nCommand: {cmd}\nHarness error: {e}"
-        state.events.emit("verify", cmd=cmd, exit_code=code)
+        key = fix_command_paths(cmd).strip()
+        cached = state.verify_cache.get(key)
+        if cached and cached[0] == state.version:
+            code, out = cached[1], cached[2]
+            state.events.emit("verify", cmd=cmd, exit_code=code, cached=True)
+        else:
+            print(f"[*] Acceptance check: {cmd}")
+            t0 = time.monotonic()
+            try:
+                code, out = container_exec(state, key)
+            except Exception as e:
+                state.events.emit("verify", cmd=cmd, error=str(e))
+                return f"ACCEPTANCE CHECK COULD NOT RUN\nCommand: {cmd}\nHarness error: {e}"
+            state.verify_cache[key] = (state.version, code, out)
+            state.verify_seconds[key] = time.monotonic() - t0
+            state.events.emit("verify", cmd=cmd, exit_code=code, seconds=round(state.verify_seconds[key], 1))
         if code != 0:
             return (f"ACCEPTANCE CHECK FAILED\nCommand: {cmd}\nExit Code: {code}\n"
                     f"Output:\n{truncate_output(compress_output(out))}")
@@ -1947,7 +1971,9 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs))
             return False, f"Stuck: the same action produced the same result {worst} times."
 
-        if CFG.status_every and state.verify_cmds and iteration - state.last_status_turn >= CFG.status_every and not wants_complete:
+        if (CFG.status_every and state.verify_cmds and iteration - state.last_status_turn >= CFG.status_every and not wants_complete
+                and state.version != state.status_version):
+            state.status_version = state.version
             done = periodic_status(state, iteration)
             if done:
                 transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
@@ -1989,6 +2015,23 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         if wants_complete:
             notes.append("NOTE: Your <status>COMPLETE</status> was ignored because you had not yet seen these results. "
                          "Re-issue it once everything is verified.")
+
+        edited = any(k in ("write_file", "replace_in_file") for k, _ in calls)
+        ran = any(k == "run_command" for k, _ in calls)
+        if (CFG.auto_verify_seconds and edited and not ran and state.verify_cmds and not wants_complete
+                and sum(state.verify_seconds.get(fix_command_paths(v).strip(), 9999) for v in state.verify_cmds) <= CFG.auto_verify_seconds):
+            failure = run_acceptance_checks(state)
+            state.events.emit("auto_verify", turn=iteration, passed=failure is None)
+            if failure is None:
+                state.last_exit_code, state.hidden_error, state.unverified_changes = 0, False, False
+                done = try_auto_complete(state, "the harness re-ran the checks after your edit")
+                if done:
+                    transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
+                    return True, done
+            else:
+                notes.append("AUTO-CHECK: you edited files without running anything, so the harness ran the acceptance checks for you:\n"
+                             + failure[:3500])
+                update_plateau(state, iteration, [failure])
 
         committed = git_checkpoint(state, f"turn {iteration}")
         if committed:
