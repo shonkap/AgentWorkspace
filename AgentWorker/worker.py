@@ -2066,6 +2066,9 @@ def consult(state: TaskState, iteration: int, focus: tuple) -> None:
     files = []
     budget = 30000
     candidates = list(reversed(state.recent_edits)) + [r for r in reversed(list(state.reads)) if r not in state.recent_edits]
+    if not candidates:
+        code, out = cexec(["bash", "-c", "git ls-files '*.py' 2>/dev/null | head -n 30"], workdir=state.container_dir)
+        candidates = [l.strip() for l in out.splitlines() if l.strip() and not l.strip().startswith(("test_", "check_"))]
     for rel in candidates[:6]:
         text, _ = container_read(posixpath.join(state.container_dir, rel))
         if text is None or rel in state.protected:
@@ -2076,7 +2079,9 @@ def consult(state: TaskState, iteration: int, focus: tuple) -> None:
         budget -= len(numbered)
         files.append(f"=== {rel} ===\n{numbered}")
     if not files:
-        return
+        print(f"[consult] skipped: no readable source files (edited={state.recent_edits}, read={list(state.reads)[:6]})")
+        state.events.emit("consult_skipped", reason="no files", edits=state.recent_edits, reads=list(state.reads)[:6])
+        return False
     prompt = (f"A coding agent keeps failing this acceptance check:\n  {name} -> {reason[:1500]}\n\nTask (start): "
               f"{state.base_prompt[:1200]}\n\nThe files it has been editing:\n" + "\n\n".join(files) +
               "\n\nFind the most likely cause of THIS failure in the code above. Consider that the failure message may be "
@@ -2093,14 +2098,16 @@ def consult(state: TaskState, iteration: int, focus: tuple) -> None:
     except Exception as e:
         print(f"[consult] failed: {e}")
         state.events.emit("consult_failed", error=str(e)[:200])
-        return
+        return False
     if not answer:
-        return
+        state.events.emit("consult_skipped", reason="empty answer")
+        return False
     state.advice = (f"ADVICE from a second reviewer about `{name}` (it read your recent files; verify it against the code before "
                     f"acting on it):\n{answer[:1200]}")
     state.advice_until = iteration + CFG.consult_turns
     state.events.emit("consult", turn=iteration, check=name, seconds=round(time.monotonic() - t0, 1), answer=answer[:300])
     log_to_transcript(state, f"=== Consult at turn {iteration} ({CFG.consult_model}) ===\n{answer}")
+    return True
 
 
 def build_status_block(state: TaskState) -> str:
@@ -2281,9 +2288,10 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
 
         if (CFG.consult_model and state.focus_since and state.status_pairs
                 and iteration - state.focus_since[1] >= CFG.consult_after and len(state.consulted) < CFG.max_consults):
-            state.consulted.add(state.focus_since)         # at most one consult per plateau
             state.focus_since = (state.focus_since[0], iteration)
-            consult(state, iteration, pick_focus(state.status_pairs))
+            state.events.emit("consult_trigger", turn=iteration)
+            if consult(state, iteration, pick_focus(state.status_pairs)):
+                state.consulted.add(iteration)
         dropped = trim_history(history)
         if dropped:
             state.reads.clear()          # the trimmed turns held those file contents: re-reading is legitimate again
