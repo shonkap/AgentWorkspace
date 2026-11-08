@@ -68,8 +68,15 @@ rewrite the whole file. Splitting the work into separate, well-checked tasks hel
    C (no movement while a menu is open) 5 turns, B1 (HUD layout) 18 turns, B2 (sprite) failed, B3 (camera not applied
    when drawing, given the diagnosis) 15 turns.
    **Result: `check_office2.py` prints ALL CHECKS PASSED**, and every stage 2 acceptance command passes.
-5. UI polish (`ui_check.py`): the checks pass, but the menus overflow and overlap when you actually look at them.
-   This task makes the game report its menu layout, which is checked for containment, overlap and a screenshot diff.
+5. UI polish (`ui_check.py`): the checks passed, but the menus overflowed and overlapped when you actually looked at
+   them. The game now reports its menu layout, and the checker verifies containment, overlap, a screenshot diff, and
+   that the reported text rectangles cover the real white text pixels (round 1 passed with under-reported label
+   widths; the pixel check closed that gap). Round 1 passed in 42 turns, round 2 in 59.
+
+**Final state:** check_office2.py ALL CHECKS PASSED, ui_check.py PASSED, 63 unit tests OK. A backup is in
+`workspace/office-game.stage2-done/`.
+Not done yet (not checked by anything): the top-left HUD panel is a large dark box holding only the name; the HUD
+portrait is tiny; the message toast sits half under the bottom bar. Stage 2B (HANDOFF section 8) is untouched.
 
 Lesson: the local 35B is good at well-scoped tasks (5–35 turns) with a fast, precise checker. It fails at "fix these 8
 unrelated things in a big file". The highest-leverage work is writing the task brief and the checker, the way a lead
