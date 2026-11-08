@@ -36,6 +36,9 @@ Branch: `worker-improvements` (one commit per change). See HANDOFF.md for the ba
 | A cut-off `write_file` gets a specific message ("nothing was written; edit in small steps or move code into a new module") | |
 | Edited `.py` files are compile-checked immediately | |
 | Small unchanged ranges (60 lines or fewer) are re-shown once instead of refused | |
+| **Best-state guard**: the harness records the git commit with the fewest failures. When failures rise 3+ above it, the model gets `git diff`/`git checkout` commands for that commit; a task that fails is reset to its best commit | V21–V26 had quietly made the game worse (16 -> 35 failures); I reset it to the post-refactor commit by hand |
+| The consult fires when the failure count has not improved for 20 turns (max 3 per task). Skips are logged | |
+| Unmeasured verify commands count as 5 s when deciding whether auto-verify is cheap | auto-verify had never fired on the game |
 | Code map in the task prompt: files, line counts, `def`/`class` lines (protected files marked) | |
 | Live transcript `logs/live_<task>.txt`, written as the run goes and including thinking (tail -f it) | |
 | Orphaned sandbox commands are stopped at startup | |
@@ -59,7 +62,7 @@ rewrite the whole file. Splitting the work into separate, well-checked tasks hel
 2. `dev/office_refactor_task2.txt`: split main.py into input_router/render/hud/game_engine modules. The checker is
    `refactor_check.py`: no new failures, identical screenshots, sizes. It prints a pixel diff and saves `refactor_diff.png`.
    The first two runs failed (a stuck loop and an abort); **the third PASSED in 20 turns**.
-3. officeV21: the stage 2 game task again, on the modular code. 16 failing checks remain (8 checks, each failing in
+3. officeV21–V27: the stage 2 game task again, on the modular code. 16 failing checks remain (8 checks, each failing in
    script and live mode): live input routing, pause, and HUD layout.
 
 ## Runs
@@ -67,3 +70,11 @@ rewrite the whole file. Splitting the work into separate, well-checked tasks hel
 - officeV11–V20: stopped and restarted as the harness changed. They fixed the client sprite and the camera.
 - office_perf: PASSED (10 turns). office_refactor3: PASSED (20 turns).
 - `dev/summarize_runs.py` prints one comparison line per run.
+
+## Open problems / ideas for next time
+- With thinking always on, the 35B still overthinks the hard live-input checks (about 1 in 3 turns hits the 14k cap).
+  Worth trying `--think adaptive` now that FOCUS, salvage and the hard lock exist.
+- One of the failure messages in check_office2.py is misleading: "michael is at (330, 240) after 0 frames" really means
+  the dump's `"frame"` field is wrong, while the movement is fine. I did not edit the judge (HANDOFF rule); the user may want to.
+- The consult (27B, about 10 min) is valuable but slow, because the models swap on the GPU. It could run on the
+  1080's Ollama instead, with a smaller model.
