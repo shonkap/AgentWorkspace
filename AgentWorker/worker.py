@@ -2223,7 +2223,7 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
         stuck = (f"The same {len(names)} check(s) have failed at the last 3 status checks (about {3 * CFG.status_every} turns). Your current approach "
                  "is not working. Stop reading and theorizing: run the failing thing, read its first error line, and change code.")
     state.status_pairs, state.status_turn = pairs, iteration
-    regression = track_best(state, iteration, len(pairs))
+    regression = track_best(state, iteration, len(pairs)) if pairs else ""   # unparsable output (a crash) is never "best"
     if regression:
         extra.append(regression)
     if pairs and (not state.focus_since or len(pairs) < state.focus_since[0]):
