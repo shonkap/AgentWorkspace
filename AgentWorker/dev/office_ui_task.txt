@@ -1,0 +1,34 @@
+WORKDIR: office-game
+REQUIRE: ui_check.py
+REQUIRE: subset_check.py
+REQUIRE: baseline_none.txt
+PROTECT: ui_check.py
+PROTECT: subset_check.py
+PROTECT: baseline_none.txt
+PROTECT: check_office2.py
+PROTECT: quick_check.py
+PROTECT: perf_check.py
+PROTECT: refactor_check.py
+PROTECT: economy_ref.py
+PROTECT: test_economy_ref.py
+QUICKCHECK: python3 ui_check.py
+
+UI POLISH TASK for the office game in tamagotchi/ (only that folder is the live game; modules: main.py setup and loop,
+input_router.py keys, game_engine.py state/update/dump, render.py drawing, hud.py HUD, draw_utils.py menu and dialog
+drawing, world.py layout, economy.py rules engine - never change economy.py).
+
+The game passes all its acceptance checks, but the menus look broken when you actually play:
+ - The client negotiation dialog (python3 tamagotchi/main.py --open client --start-minute 600 --frames 10 --screenshot x.png)
+   has 7 offers but the panel only fits 2: the items run out of the panel and under the bottom HUD bar, and the hint line
+   "Up/Down choose  Enter select  Esc back" is drawn ON TOP of the third item.
+ - On the desktop (--open desktop) the icon labels "Email", "Card Game", "Reports", "Log off" collide with each other.
+Fix the layout of every office menu (desktop, vending, client, fax and their sub-screens): size each panel from its
+content (title, text lines, items, hint at the bottom), keep it above the HUD bar (window y < 460), use the small font or
+two columns if needed, and center labels under icons with enough spacing.
+Report what you draw: add "menu_layout" to --dump-state as described in the docstring of ui_check.py, computed from the
+same numbers the drawing code uses (font.size() of each string). Run `python3 ui_check.py` after every change (a few
+seconds) and LOOK at the saved ui_<kind>.png screenshots with view_image. check_office2.py must keep passing.
+
+VERIFY: python3 ui_check.py
+VERIFY: python3 subset_check.py baseline_none.txt "@@no-target@@"
+VERIFY: python3 -m unittest discover -s tamagotchi -p "test_*.py"
