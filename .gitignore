@@ -2,3 +2,5 @@
 # Venv and Env folders
 AgentWorker/venv/
 AgentWorker/.venv/
+AgentWorker/workspace/
+__pycache__/

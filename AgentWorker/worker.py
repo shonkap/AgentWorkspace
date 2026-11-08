@@ -80,6 +80,18 @@ class Config:
     auto_view_gap: int = 6                # at least this many turns between automatic attachments
     notes_every: int = 8                  # the harness writes the progress notes itself when the model has not (0 = off)
     status_every: int = 10                # the harness runs the acceptance checks itself every N turns and tells the model the result (0 = off)
+    auto_verify_seconds: float = 90.0     # after an edit-only turn, run the checks for the model if they take at most this long (0 = off)
+    initial_status: bool = True           # existing project: run the checks before turn 1 and pin the failures
+    code_map: bool = True                 # existing project: show a file/definition outline in the task prompt
+    protected_read_lines: int = 200       # read_file shows at most this many lines of each PROTECTED file per task
+    salvage_thinking_chars: int = 3000    # when thinking eats the whole reply budget, show the model this much of its tail
+    consult_model: str = "qwen3.6-27b-uncensored:latest"   # second opinion when stuck on one check ("" = off)
+    consult_after: int = 20               # no fewer failing checks for this many turns triggers a consult
+    regression_margin: int = 3            # this many more failing checks than the best checkpoint triggers a warning
+    max_consults: int = 3                 # per task (each one swaps models on the GPU: several minutes)
+    consult_turns: int = 10               # the advice stays pinned for this many turns
+    blind_edit_limit: int = 3             # after this many edit-only turns in a row, the harness runs the checks even if slow
+    min_read_lines: int = 150             # read_file ranges smaller than this are widened (0 = off)
     readonly_nudge: int = 8               # this many turns of ONLY reading (no command, no edit) triggers a 'run something' nudge
     plateau_turns: int = 15               # the same checks failing for this many turns triggers a 'step back' nudge
     fast_timeout: float = 90.0            # seconds; the small model only does short jobs, so don't wait minutes for it
@@ -88,8 +100,9 @@ class Config:
     max_iterations: int = 100
     model_retries: int = 2
     command_timeout: int = 600            # per command, enforced inside the container
-    max_output_chars: int = 4000          # command output shown to the model (head + tail)
-    max_read_chars: int = 16000           # read_file output shown to the model (about 250 lines at once)
+    max_output_chars: int = 8000          # command output shown to the model (head + tail)
+    think_char_limit: int = 14000         # reasoning longer than this (without an answer) is cut off and salvaged (0 = off)
+    max_read_chars: int = 24000           # read_file output shown to the model (about 250 lines at once)
     max_history_chars: int = 0            # 0 = derive from num_ctx and num_predict
     max_notes_chars: int = 2500           # pinned summary of trimmed turns
 
@@ -209,6 +222,7 @@ class TaskState:
     tool_calls: int = 0
     unverified_changes: bool = False   # files changed since the last successful command
     verify_cmds: list = field(default_factory=list)
+    quick_cmds: list = field(default_factory=list)
     verify_failures: int = 0
     notes: str = ""                    # summary of trimmed history, pinned in the task prompt
     base_prompt: str = ""
@@ -225,8 +239,29 @@ class TaskState:
     last_self_notes_turn: int = 0
     last_status_turn: int = 0
     status_block: str = ""                            # the latest authoritative status, shown on EVERY turn until replaced
+    status_pairs: list = field(default_factory=list)  # [(check name, reason)] still failing per the latest status
+    status_turn: int = 0
+    status_extra: list = field(default_factory=list)
+    status_fixed: list = field(default_factory=list)
     status_history: list = field(default_factory=list)   # failing-check sets of the periodic status checks
     readonly_streak: int = 0
+    protected: dict = field(default_factory=dict)        # rel path -> original text of files the agent must not change
+    reads: dict = field(default_factory=dict)            # rel -> (content hash, set of line numbers shown) still in the history
+    protected_lines_read: dict = field(default_factory=dict)
+    reshown: set = field(default_factory=set)            # small unchanged ranges already shown a second time   # rel -> lines of a protected file shown so far
+    recent_edits: list = field(default_factory=list)     # rel paths edited, newest last
+    best: tuple = ()                                     # (fewest failing checks, git commit, turn)
+    focus_since: tuple = ()                              # (fewest failing checks seen, turn it was reached)
+    consulted: set = field(default_factory=set)          # FOCUS checks a consult was already asked about
+    advice: str = ""
+    advice_until: int = 0
+    hard_lock: bool = False                              # this reply may not read at all (set after salvaged reasoning)
+    blind_edits: int = 0                                 # consecutive turns that edited files without running anything
+    read_locked: bool = False                            # reading is refused until the agent edits or runs something
+    iteration: int = 0
+    verify_cache: dict = field(default_factory=dict)     # verify cmd -> (version, exit code, output)
+    verify_seconds: dict = field(default_factory=dict)   # verify cmd -> seconds its last run took
+    status_version: str = ""                             # work-dir fingerprint at the last periodic status check
     last_readonly_nudge: int = 0
     learned: list = field(default_factory=list)          # LEARNED: lines from the model's own replies
     plan: str = ""                                       # its latest PLAN: line
@@ -244,6 +279,28 @@ class TaskState:
     stats: dict = field(default_factory=lambda: {
         "turns": 0, "gen_tokens": 0, "gen_seconds": 0.0, "think_chars": 0, "wall_seconds": 0.0,
         "truncated_replies": 0, "context_near_limit": 0, "budget_exhausted": 0})
+
+
+class LiveTranscript(list):
+    """The task transcript, also appended to logs/live_<task>.txt as it grows, so a run can be followed with tail -f."""
+
+    def __init__(self, path: Optional[str] = None):
+        super().__init__()
+        self.path = path
+        if path:
+            try:
+                open(path, "w", encoding="utf-8").close()
+            except OSError:
+                self.path = None
+
+    def append(self, text: str) -> None:
+        super().append(text)
+        if self.path:
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(text + "\n\n")
+            except OSError:
+                pass
 
 
 def log_to_transcript(state: "TaskState", text: str) -> None:
@@ -271,13 +328,52 @@ def parse_task_file(text: str) -> tuple[str, list[str], Optional[str]]:
     verify = [m.group(1).strip() for m in re.finditer(r"^\s*VERIFY:\s*(.+?)\s*$", text, re.IGNORECASE | re.MULTILINE)]
     m = re.search(r"^\s*WORKDIR:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)
     workdir = os.path.basename(m.group(1).rstrip("/")) if m else None
-    goal = re.sub(r"^\s*(?:VERIFY|WORKDIR|REQUIRE):.*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+    goal = re.sub(r"^\s*(?:VERIFY|WORKDIR|REQUIRE|PROTECT|QUICKCHECK):.*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
     return goal, [v for v in verify if v], workdir
 
 
 def parse_required_files(text: str) -> list[str]:
     """`REQUIRE: some_file.py` lines name files that must already exist in the working directory."""
     return [m.group(1) for m in re.finditer(r"^\s*REQUIRE:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)]
+
+
+def parse_quick_checks(text: str) -> list[str]:
+    """`QUICKCHECK: cmd` lines: fast partial checks the harness runs itself after every turn that edited files without
+    running anything, so the model sees the effect of each edit within seconds. VERIFY stays the judge."""
+    return [m.group(1).strip() for m in re.finditer(r"^\s*QUICKCHECK:\s*(.+?)\s*$", text, re.IGNORECASE | re.MULTILINE)]
+
+
+def parse_protected_files(text: str) -> list[str]:
+    """`PROTECT: judge.py` lines name files the agent may read and run but never change (checkers, reference tests).
+    The harness refuses edits to them and restores them if a shell command changed them."""
+    return [m.group(1) for m in re.finditer(r"^\s*PROTECT:\s*(\S+)\s*$", text, re.IGNORECASE | re.MULTILINE)]
+
+
+def snapshot_protected(state: "TaskState", paths: list[str]) -> list[str]:
+    """Remember the exact contents of the protected files. Returns the ones that could not be read."""
+    missing = []
+    for p in paths:
+        abs_path = posixpath.join(state.container_dir, p)
+        text, _ = container_read(abs_path)
+        if text is None:
+            missing.append(p)
+        else:
+            state.protected[posixpath.normpath(p)] = text
+    return missing
+
+
+def restore_protected(state: "TaskState") -> list[str]:
+    """Put back any protected file that a command modified or deleted. Returns the restored paths."""
+    restored = []
+    for rel, text in state.protected.items():
+        abs_path = posixpath.join(state.container_dir, rel)
+        now, _ = container_read(abs_path)
+        if now != text:
+            container_write(abs_path, text)
+            restored.append(rel)
+    if restored:
+        state.events.emit("protected_restored", files=restored)
+    return restored
 
 
 # ================= SAFETY LAYERS =================
@@ -353,6 +449,31 @@ def truncate_output(text: str, limit: Optional[int] = None) -> str:
     head = limit // 2
     tail = limit - head
     return f"{text[:head]}\n\n[... {len(text) - limit} characters omitted ...]\n\n{text[-tail:]}"
+
+
+PASS_LINE_RE = re.compile(r"^\s*(?:PASS(?:ED)?\b|ok\b|✓|\[\s*OK\s*\])|(?:\.\.\.|::\S*)\s+(?:ok|PASSED)\s*$")
+
+
+def compress_output(text: str) -> str:
+    """Test runners and checkers print hundreds of passing lines, and head+tail truncation then hides the failures in
+    the middle. Collapse runs of passing lines into one counter line so every FAIL/error line stays visible."""
+    lines = text.splitlines()
+    passes = sum(1 for l in lines if PASS_LINE_RE.search(l))
+    if passes < 8:
+        return text
+    out: list[str] = []
+    run = 0
+    for line in lines:
+        if PASS_LINE_RE.search(line):
+            run += 1
+            continue
+        if run:
+            out.append(f"  [{run} passing line(s) hidden]")
+            run = 0
+        out.append(line)
+    if run:
+        out.append(f"  [{run} passing line(s) hidden]")
+    return f"[{passes} passing lines collapsed by the harness; every other line is shown]\n" + "\n".join(out)
 
 
 def strip_thinking(text: str) -> str:
@@ -449,6 +570,43 @@ def container_read(abs_path: str, limit: int = 1_048_576) -> tuple[Optional[str]
     if len(out.encode("utf-8", errors="replace")) > limit:
         return None, "file is larger than 1 MB; use run_command with head/sed/grep instead"
     return out, ""
+
+
+FINGERPRINT_SCRIPT = (f"find . \\( {PRUNE_EXPR} \\) -prune -o -type f -print0 | sort -z | xargs -0 -r md5sum | md5sum")
+
+
+def _cache_path(state: "TaskState") -> str:
+    return os.path.join(CFG.logs_dir, "verify_cache_" + re.sub(r"[^A-Za-z0-9_.-]", "_", state.container_dir.strip("/")) + ".json")
+
+
+def load_verify_cache(state: "TaskState") -> None:
+    """Results of acceptance checks from earlier runs on exactly the same files (same content fingerprint) are reused."""
+    try:
+        with open(_cache_path(state), encoding="utf-8") as f:
+            data = json.load(f)
+        for cmd, (fp, code, out, secs) in data.items():
+            state.verify_cache[cmd] = (fp, code, out)
+            state.verify_seconds[cmd] = secs
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def save_verify_cache(state: "TaskState") -> None:
+    data = {cmd: [fp, code, out, state.verify_seconds.get(cmd, 0)] for cmd, (fp, code, out) in state.verify_cache.items()}
+    try:
+        with open(_cache_path(state), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+def workdir_fingerprint(state: "TaskState") -> str:
+    """Content hash of every file in the task directory (not mtimes: regenerating identical files changes nothing)."""
+    try:
+        code, out = cexec(["bash", "-c", FINGERPRINT_SCRIPT], workdir=state.container_dir, timeout=60)
+    except Exception:
+        return f"error-{time.time()}"
+    return out.strip() if code == 0 else f"error-{time.time()}"
 
 
 def container_find_empty_files(directory: str, limit: int = 20) -> list[str]:
@@ -587,17 +745,25 @@ def execute_run_command(state: TaskState, command: str) -> str:
             state.last_exit_code = 1
             return a_msg
 
+    is_check = clean_cmd in [fix_command_paths(v).strip() for v in state.verify_cmds]
+    t0 = time.monotonic()
     try:
         exit_code, output = container_exec(state, clean_cmd)
     except Exception as e:
         state.last_exit_code = 1
         return f"Container execution error: {e}"
+    if is_check:
+        state.verify_cache[clean_cmd] = (workdir_fingerprint(state), exit_code, output)
+        state.verify_seconds[clean_cmd] = time.monotonic() - t0
+        save_verify_cache(state)
 
     state.last_exit_code = exit_code
     if exit_code == 0:
         state.unverified_changes = False
 
-    report = f"Exit Code: {exit_code}\nOutput:\n{truncate_output(output)}"
+    if not is_check:
+        prune_status(state, output)      # e.g. a partial checker run shows checks that pass now
+    report = f"Exit Code: {exit_code}\nOutput:\n{truncate_output(compress_output(output))}"
 
     if exit_code in (124, 137):
         report += f"\n\n[INSPECTOR ALERT]: Command hit the {CFG.command_timeout}s timeout and was killed. Avoid interactive or long-running commands."
@@ -653,12 +819,36 @@ def resolve_container_path(state: TaskState, path: str, *, allow_root: bool = Fa
     return f"{root}/{norm}", norm
 
 
+def note_edit(state: "TaskState", rel: str) -> None:
+    if rel in state.recent_edits:
+        state.recent_edits.remove(rel)
+    state.recent_edits.append(rel)
+    del state.recent_edits[:-6]
+
+
+def syntax_note(abs_path: str, rel: str) -> str:
+    """Compile an edited Python file right away, so a broken edit is reported in the same turn, not minutes later."""
+    if not rel.endswith(".py"):
+        return ""
+    try:
+        code, out = cexec(["python3", "-c", "import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])", abs_path], timeout=30)
+    except Exception:
+        return ""
+    if code == 0:
+        return ""
+    lines = [l for l in out.strip().splitlines() if l.strip()]
+    return ("\nWARNING: the file no longer compiles. Fix this first:\n" + "\n".join(lines[-4:]))
+
+
 def execute_write_file(state: TaskState, path: str, content: str) -> str:
     state.tool_calls += 1
     try:
         abs_path, rel = resolve_container_path(state, path, for_write=True)
     except ValueError as e:
         return f"Failed to write file: {e}"
+    if rel in state.protected:
+        return (f"REFUSED: {rel} is a protected file (a checker or reference the task forbids changing). Change YOUR code "
+                "so that it passes instead; you may read and run the protected file.")
 
     text = content.replace("\xa0", " ")
     if text.startswith("\n"):
@@ -673,9 +863,10 @@ def execute_write_file(state: TaskState, path: str, content: str) -> str:
         return f"Failed to write file: {err}"
 
     state.unverified_changes = True
+    note_edit(state, rel)
     if not text.strip() and posixpath.basename(abs_path) not in EMPTY_FILE_OK:
         return f"ERROR: {state.container_dir}/{rel} was written empty. Provide the file contents."
-    return f"Successfully wrote {len(text)} characters to {state.container_dir}/{rel}"
+    return f"Successfully wrote {len(text)} characters to {state.container_dir}/{rel}" + syntax_note(abs_path, rel)
 
 
 def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> str:
@@ -684,6 +875,9 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
         abs_path, rel = resolve_container_path(state, path, for_write=True)
     except ValueError as e:
         return f"Failed to edit file: {e}"
+    if rel in state.protected:
+        return (f"REFUSED: {rel} is a protected file (a checker or reference the task forbids changing). Change YOUR code "
+                "so that it passes instead; you may read and run the protected file.")
 
     text, err = container_read(abs_path)
     if text is None:
@@ -696,8 +890,18 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
         return "Failed to edit file: <old> is empty."
     count = text.count(old_s)
     if count == 0:
-        return (f"Failed to edit {rel}: <old> text was not found. It must match the file exactly, including "
-                "whitespace. Use read_file to see the current contents.")
+        fuzzy = fuzzy_replace(text, old_s, new_s)
+        if isinstance(fuzzy, str):
+            return f"Failed to edit {rel}: {fuzzy}"
+        new_text, where = fuzzy
+        print(f"\n[Tool: replace_in_file] Editing {state.container_dir}/{rel} (whitespace-tolerant match at line {where})")
+        err = container_write(abs_path, new_text)
+        if err:
+            return f"Failed to edit file: {err}"
+        state.unverified_changes = True
+        note_edit(state, rel)
+        return (f"Successfully edited {state.container_dir}/{rel} (1 replacement at line {where}; <old> matched only when "
+                "ignoring indentation, so the indentation of the file was kept)" + syntax_note(abs_path, rel))
     if count > 1:
         return f"Failed to edit {rel}: <old> matches {count} places. Include more surrounding lines so it matches exactly once."
 
@@ -706,7 +910,66 @@ def execute_replace_in_file(state: TaskState, path: str, old: str, new: str) -> 
     if err:
         return f"Failed to edit file: {err}"
     state.unverified_changes = True
-    return f"Successfully edited {state.container_dir}/{rel} (1 replacement)"
+    note_edit(state, rel)
+    return f"Successfully edited {state.container_dir}/{rel} (1 replacement)" + syntax_note(abs_path, rel)
+
+
+HARD_LOCK_MSG = ("REFUSED: reading is disabled for this reply. You already reasoned about the fix; write it now with "
+                 "replace_in_file or write_file, then run the check.")
+READ_LOCK_MSG = ("REFUSED: re-reading files and list_dir are locked because you have read for many turns without changing "
+                 "anything. You already read this file; its contents are above. Make the change you believe is needed NOW (replace_in_file / write_file); "
+                 "reading unlocks as soon as you edit a file. If you need one exact line, use run_command with grep -n.")
+
+
+def _indent(line: str) -> str:
+    return line[:len(line) - len(line.lstrip())]
+
+
+def fuzzy_replace(text: str, old: str, new: str):
+    """<old> was not found verbatim. Try matching line by line with leading/trailing whitespace ignored; on a unique match
+    replace those lines and re-indent <new> to fit the file. Returns (new_text, line_number) or an error message that
+    shows the closest region of the file."""
+    import difflib
+    lines = text.split("\n")
+    old_lines = [l for l in old.split("\n")]
+    while old_lines and not old_lines[0].strip():
+        old_lines.pop(0)
+    while old_lines and not old_lines[-1].strip():
+        old_lines.pop()
+    if not old_lines:
+        return "<old> is empty."
+    key = [l.strip() for l in old_lines]
+    n = len(key)
+    hits = [i for i in range(len(lines) - n + 1) if [l.strip() for l in lines[i:i + n]] == key]
+    if len(hits) == 1:
+        i = hits[0]
+        file_ind = [_indent(l) for l in lines[i:i + n]]
+        old_ind = [_indent(l) for l in old_lines]
+        new_lines = new.split("\n")
+        deltas = {len(f) - len(o) for f, o in zip(file_ind, old_ind)}
+        if len(deltas) == 1:
+            d = deltas.pop()
+            fixed = [(" " * d + l) if d >= 0 else (l[min(-d, len(_indent(l))):]) for l in new_lines]
+        elif len(new_lines) == n:
+            fixed = [file_ind[k] + l.lstrip() if l.strip() else l for k, l in enumerate(new_lines)]
+        else:
+            d = len(file_ind[0]) - len(old_ind[0])
+            fixed = [(" " * d + l) if d >= 0 else (l[min(-d, len(_indent(l))):]) for l in new_lines]
+        return "\n".join(lines[:i] + fixed + lines[i + n:]), i + 1
+    if len(hits) > 1:
+        return (f"<old> matches {len(hits)} places (ignoring whitespace) at lines {', '.join(str(h + 1) for h in hits[:6])}. "
+                "Include more surrounding lines so it matches exactly once.")
+    # no match: show the most similar window so the model can copy the real text
+    best, best_i = 0.0, 0
+    first = key[0]
+    for i in range(len(lines)):
+        r = difflib.SequenceMatcher(None, lines[i].strip(), first).ratio()
+        if r > best:
+            best, best_i = r, i
+    lo, hi = max(0, best_i - 2), min(len(lines), best_i + n + 3)
+    snippet = "\n".join(f"{k + 1:>5} | {lines[k]}" for k in range(lo, hi))
+    return ("<old> text was not found (not even ignoring whitespace). The most similar part of the file is shown below; copy "
+            f"<old> EXACTLY from it (without the line numbers), or read the file again:\n{snippet}")
 
 
 def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) -> str:
@@ -723,19 +986,70 @@ def execute_read_file(state: TaskState, path: str, lines_spec: Optional[str]) ->
 
     all_lines = text.splitlines()
     start, end = 1, max(len(all_lines), 1)
+    req_end = end
     if lines_spec:
         m = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", lines_spec)
         if not m:
             return f"Failed to read file: lines must look like lines=\"10-50\", got {lines_spec!r}."
         start, end = max(int(m.group(1)), 1), min(int(m.group(2)), len(all_lines))
-    selected = all_lines[start - 1:end]
-    numbered = "\n".join(f"{i:>5} | {line}" for i, line in enumerate(selected, start))
-    header = f"{state.container_dir}/{rel} (lines {start}-{end} of {len(all_lines)}; the numbers are display-only, not part of the file):"
-    return f"{header}\n{truncate_output(numbered, CFG.max_read_chars)}"
+        req_end = end
+        if CFG.min_read_lines and end - start + 1 < CFG.min_read_lines:
+            # small chunks cost one turn each: widen the window forward (the start stays where the model asked)
+            end = min(len(all_lines), start + CFG.min_read_lines - 1)
+    if end < start:
+        return f"Failed to read file: {rel} has only {len(all_lines)} lines."
+
+    digest = short_hash(text)
+    seen_digest, covered = state.reads.get(rel, (None, set()))
+    if seen_digest != digest:
+        covered = set()                     # never read, or changed since: everything is new
+    wanted = set(range(start, max(start, req_end) + 1))      # what the model asked for (before widening)
+    new_lines = wanted - covered
+    if state.hard_lock:
+        return HARD_LOCK_MSG
+    if state.read_locked and len(new_lines) < 0.5 * len(wanted):
+        return READ_LOCK_MSG
+    small = len(wanted) <= 60
+    reshow_key = (rel, start, req_end, digest)
+    if small and not new_lines and not state.hard_lock and reshow_key not in state.reshown:
+        state.reshown.add(reshow_key)
+        # a few exact lines (usually to copy <old> text): cheaper to show them again than to argue
+        end = max(start, req_end)
+        body = "\n".join(f"{i:>5} | {all_lines[i - 1]}" for i in range(start, end + 1))
+        return (f"{state.container_dir}/{rel} (lines {start}-{end} of {len(all_lines)}, UNCHANGED since you last read them; "
+                f"shown again):\n{body}")
+    if not new_lines:
+        return (f"{rel} lines {start}-{max(start, req_end)} are UNCHANGED since you read them; that result is still in this conversation "
+                "above. Do not read them again: use what you already have, and act (edit or run).")
+    if rel in state.protected:
+        budget = CFG.protected_read_lines - state.protected_lines_read.get(rel, 0)
+        if budget <= 0:
+            return (f"REFUSED: {rel} is a protected checker and you have already read {CFG.protected_read_lines} lines of it. "
+                    "Do not study it: the AUTHORITATIVE STATUS lists every failing check with its reason, and running it shows the "
+                    f"rest. To see the code of ONE check, use run_command: grep -n -A 15 'words from the check name' {rel}")
+        end = min(end, start + budget - 1)
+        state.protected_lines_read[rel] = state.protected_lines_read.get(rel, 0) + (end - start + 1)
+
+    # Cut at a line boundary (never hide the middle), so the lines reported as shown really were shown.
+    shown, size = [], 0
+    for i in range(start, end + 1):
+        line = f"{i:>5} | {all_lines[i - 1]}"
+        if shown and size + len(line) + 1 > CFG.max_read_chars:
+            break
+        shown.append(line)
+        size += len(line) + 1
+    last = start + len(shown) - 1
+    state.reads[rel] = (digest, covered | set(range(start, last + 1)))
+    header = (f"{state.container_dir}/{rel} (lines {start}-{last} of {len(all_lines)}; the numbers are display-only, not part "
+              "of the file):")
+    more = f"\n[stopped at line {last} to save context; read lines=\"{last + 1}-{end}\" for the rest]" if last < end else ""
+    return header + "\n" + "\n".join(shown) + more
 
 
 def execute_list_dir(state: TaskState, path: str) -> str:
     state.tool_calls += 1
+    if state.read_locked or state.hard_lock:
+        return READ_LOCK_MSG
     try:
         abs_path, rel = resolve_container_path(state, path or ".", allow_root=True)
     except ValueError as e:
@@ -1001,6 +1315,26 @@ def dispatch_tool(state: TaskState, kind: str, a: dict) -> tuple[str, str, str]:
 
 
 # ================= SANDBOX =================
+ORPHAN_SCRIPT = r"""
+for p in /proc/[0-9]*; do
+  pid=${p#/proc/}
+  [ "$pid" = "$$" ] && continue
+  c=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
+  case "$c" in "timeout --kill-after="*) echo "$pid $c"; kill -TERM "$pid" 2>/dev/null; kill -TERM -"$pid" 2>/dev/null;; esac
+done
+"""
+
+
+def kill_orphans() -> None:
+    """Commands from a worker that was killed keep running inside the container (docker exec does not stop them) and would
+    compete with the new run for CPU. Every harness command runs under `timeout --kill-after=...`, so stop those."""
+    try:
+        _, out = cexec(["bash", "-c", ORPHAN_SCRIPT])
+    except Exception:
+        return
+    if out.strip():
+        print(f"[*] Stopped {len(out.strip().splitlines())} leftover command(s) from an earlier worker run:\n{out.strip()[:500]}")
+
 def ensure_sandbox_running() -> None:
     print("[*] Checking sandbox container status...")
     container = None
@@ -1027,6 +1361,7 @@ def ensure_sandbox_running() -> None:
         )
         print(f"[✓] Container '{CFG.container_name}' is ready.")
     check_sandbox_tools()
+    kill_orphans()
     # Task dirs are chown'd to the host user when a task ends, so root-in-container git would
     # otherwise refuse them as "dubious ownership" on the next attempt (PlatformIO also uses git).
     try:
@@ -1051,11 +1386,13 @@ def build_system_prompt(state: TaskState) -> str:
         "the harness checkpoints your work automatically.\n"
         f"5. Commands are killed after {CFG.command_timeout}s. Never run interactive or never-ending commands.\n"
         "6. Keep each file under ~300 lines and each reply reasonably short; overlong replies get cut off and lose their tool calls.\n"
-        "7. Tool calls in one reply run in order, but you only see their results afterwards. Batch independent calls "
-        "into ONE reply (for example read several files at once) instead of one call per turn; turns are limited.\n"
+        "7. Tool calls in one reply run in order, but you only see their results afterwards, and turns are limited. "
+        "Do several steps per reply: read ALL the files you need in one reply; and after an edit, put the command that "
+        "tests it (for example an acceptance check) in the SAME reply, after the edit.\n"
         "8. If you keep getting the same result, change your approach instead of repeating yourself.\n"
-        "9. NEVER answer with a tutorial, a plan, or markdown code blocks: the harness can only act on tool tags. "
-        "Every reply must contain tool tags (or <status>COMPLETE</status>); put code inside <write_file>.\n"
+        "9. Never answer with a tutorial or markdown code blocks: the harness can only act on tool tags. Every reply must "
+        "contain tool tags (or <status>COMPLETE</status>); put code inside <write_file>. Progress means CHANGING files: "
+        "after you have read the relevant code once, edit it; do not keep re-reading.\n"
         "10. There is no display. Programs with an endless loop (games, servers) must be able to exit on their own, "
         "e.g. via a --frames N flag, so that you can run and verify them.\n"
         + ("11. End EVERY reply with <turns_left>N</turns_left>: your honest estimate of how many more turns you need to "
@@ -1092,14 +1429,59 @@ def build_task_prompt(state: TaskState, goal: str) -> str:
         checks = "\n".join(f"- {c}" for c in state.verify_cmds)
         parts.append("Acceptance checks (run automatically by the harness when you declare completion; "
                      f"you may run them yourself first, from {state.container_dir}):\n{checks}")
+    if state.quick_cmds:
+        parts.append("QUICK checks (fast partial checks; the harness also runs them for you after every reply that edits files "
+                     "without running anything):\n" + "\n".join(f"- {c}" for c in state.quick_cmds))
+    if state.protected:
+        parts.append("PROTECTED files (read and run them, never change them; the harness refuses edits and restores them): "
+                     + ", ".join(sorted(state.protected)))
     if CFG.isolate_tasks:
         parts.append(f"Note: your working directory is {state.container_dir}. A path in the goal that names this project "
                      "(e.g. /workspace/office-game) means this directory. Other files under /workspace, such as shared "
                      "reference images, can be read from the shell, but write only inside your working directory.")
     if state.preexisting_files:
-        parts.append("NOTE: your working directory already contains files from an earlier interrupted attempt. "
-                     "Inspect them with list_dir/read_file and continue rather than starting over.")
+        parts.append("NOTE: your working directory already contains files (an existing project or an earlier attempt). "
+                     "Continue from them rather than starting over.")
+        cmap = code_map(state)
+        if cmap:
+            parts.append("CODE MAP (made by the harness: files with their line counts and top-level definitions, so you can "
+                         "read exactly the parts you need with read_file lines=\"a-b\"):\n" + cmap)
     return "\n\n".join(parts)
+
+
+CODE_MAP_SCRIPT = r"""
+find . \( -name .git -o -name __pycache__ -o -name node_modules -o -name .pio -o -name venv -o -name .venv \) -prune -o -type f \
+  \( -name '*.py' -o -name '*.c' -o -name '*.h' -o -name '*.cpp' -o -name '*.js' -o -name '*.ts' -o -name '*.md' -o -name '*.txt' \
+     -o -name '*.json' -o -name '*.ini' -o -name '*.toml' -o -name '*.sh' \) -print | sort | head -n 60 | while read -r f; do
+  echo "${f#./} ($(wc -l < "$f") lines)"
+  case "$f" in *.py) grep -nE '^(class |def |    def )' "$f" | head -n 40 | sed 's/^/    /';; esac
+done
+"""
+
+
+def code_map(state: "TaskState", limit: int = 6000) -> str:
+    """A compact outline of the existing project: saves the model a dozen list/read turns at the start."""
+    if not CFG.code_map:
+        return ""
+    try:
+        code, out = cexec(["bash", "-c", CODE_MAP_SCRIPT], workdir=state.container_dir, timeout=30)
+    except Exception:
+        return ""
+    if code != 0 or not out.strip():
+        return ""
+    skip = set(state.protected)
+    lines, cur_skip = [], False
+    for line in out.splitlines():
+        if not line.startswith("    "):
+            name = line.split(" (")[0].removeprefix("./")
+            cur_skip = name in skip
+            if cur_skip:
+                line += "  [PROTECTED: run it, do not study it; its FAIL lines tell you what to fix]"
+        elif cur_skip:
+            continue
+        lines.append(line)
+    text = "\n".join(lines)
+    return text if len(text) <= limit else text[:limit] + "\n[code map truncated]"
 
 
 def render_task_message(state: TaskState) -> str:
@@ -1215,6 +1597,7 @@ def summarize_dropped(dropped: list[dict], notes: str, state: Optional[TaskState
 class ModelReply:
     content: Optional[str]                 # None = persistent failure
     thinking_chars: int = 0                # reasoning returned in the separate `thinking` field
+    thinking: str = ""
     hit_limit: bool = False
     done_reason: str = ""
     prompt_tokens: int = 0
@@ -1241,7 +1624,8 @@ def choose_think(state: TaskState, iteration: int):
     if mode in ("low", "medium", "high"):
         return mode
     if mode == "adaptive":
-        struggling = iteration == 1 or state.last_exit_code != 0 or state.trouble_turns > 0
+        struggling = (iteration <= 2 or state.last_exit_code != 0 or state.trouble_turns > 0
+                      or state.readonly_streak >= 3 or state.read_locked)
         if state.trouble_turns > 0:
             state.trouble_turns -= 1
         return struggling
@@ -1263,6 +1647,44 @@ def heavy_chat(messages: list[dict], options: dict, think=None):
         raise
 
 
+def streamed_chat(messages: list[dict], options: dict, think=None) -> dict:
+    """Like heavy_chat, but streamed, so that runaway reasoning can be cut off at CFG.think_char_limit characters (the reply
+    then looks like one that hit the output limit, and the caller salvages the reasoning). Returns a plain dict."""
+    kwargs = {"think": think} if (think is not None and CFG.think_supported) else {}
+    stream = heavy_client.chat(model=CFG.heavy_model, messages=messages, options=options,
+                               keep_alive=CFG.heavy_keep_alive, stream=True, **kwargs)
+    thinking, content, last = [], [], None
+    tchars = 0
+    t0 = time.monotonic()
+    cut = False
+    for chunk in stream:
+        last = chunk
+        msg = _field(chunk, "message", None)
+        th = _field(msg, "thinking", "") or ""
+        if th:
+            thinking.append(th)
+            tchars += len(th)
+        c = _field(msg, "content", "") or ""
+        if c:
+            content.append(c)
+        if CFG.think_char_limit and tchars > CFG.think_char_limit and not content:
+            cut = True
+            break
+    if cut:
+        try:
+            stream.close()
+        except Exception:
+            pass
+        print(f"[think] reasoning passed {CFG.think_char_limit} characters without an answer; cut off and salvaged.")
+        return {"message": {"content": "", "thinking": "".join(thinking)}, "done_reason": "length",
+                "prompt_eval_count": 0, "eval_count": tchars // 4, "eval_duration": int((time.monotonic() - t0) * 1e9),
+                "load_duration": 0, "think_cut": True}
+    return {"message": {"content": "".join(content), "thinking": "".join(thinking)},
+            "done_reason": _field(last, "done_reason", ""), "prompt_eval_count": _field(last, "prompt_eval_count", 0),
+            "eval_count": _field(last, "eval_count", 0), "eval_duration": _field(last, "eval_duration", 0),
+            "load_duration": _field(last, "load_duration", 0)}
+
+
 def query_heavy_model(history: list[dict], think=None) -> ModelReply:
     options = {"num_predict": CFG.num_predict, "num_ctx": CFG.num_ctx, "temperature": CFG.temperature}
     last_err = ""
@@ -1270,11 +1692,15 @@ def query_heavy_model(history: list[dict], think=None) -> ModelReply:
     for attempt in range(1, CFG.model_retries + 1):
         try:
             print(f"[*] Querying {CFG.heavy_model} (Attempt {attempt}/{CFG.model_retries})...")
-            res = heavy_chat(history, options, think)
+            if CFG.think_char_limit and think not in (None, False) and CFG.think_supported:
+                res = streamed_chat(history, options, think)
+            else:
+                res = heavy_chat(history, options, think)
             msg = res["message"]
             return ModelReply(
                 content=msg["content"] or "",
                 thinking_chars=len(_field(msg, "thinking", "") or ""),
+                thinking=str(_field(msg, "thinking", "") or ""),
                 hit_limit=_field(res, "done_reason", "") == "length",
                 done_reason=str(_field(res, "done_reason", "") or ""),
                 prompt_tokens=int(_field(res, "prompt_eval_count", 0) or 0),
@@ -1391,16 +1817,26 @@ def completion_blocker(state: TaskState) -> Optional[str]:
 def run_acceptance_checks(state: TaskState) -> Optional[str]:
     """Run the task's VERIFY commands ourselves. Returns None if all pass, else a failure report."""
     for cmd in state.verify_cmds:
-        print(f"[*] Acceptance check: {cmd}")
-        try:
-            code, out = container_exec(state, fix_command_paths(cmd))
-        except Exception as e:
-            state.events.emit("verify", cmd=cmd, error=str(e))
-            return f"ACCEPTANCE CHECK COULD NOT RUN\nCommand: {cmd}\nHarness error: {e}"
-        state.events.emit("verify", cmd=cmd, exit_code=code)
+        key = fix_command_paths(cmd).strip()
+        cached = state.verify_cache.get(key)
+        if cached and cached[0] == workdir_fingerprint(state):
+            code, out = cached[1], cached[2]
+            state.events.emit("verify", cmd=cmd, exit_code=code, cached=True)
+        else:
+            print(f"[*] Acceptance check: {cmd}")
+            t0 = time.monotonic()
+            try:
+                code, out = container_exec(state, key)
+            except Exception as e:
+                state.events.emit("verify", cmd=cmd, error=str(e))
+                return f"ACCEPTANCE CHECK COULD NOT RUN\nCommand: {cmd}\nHarness error: {e}"
+            state.verify_cache[key] = (workdir_fingerprint(state), code, out)
+            state.verify_seconds[key] = time.monotonic() - t0
+            save_verify_cache(state)
+            state.events.emit("verify", cmd=cmd, exit_code=code, seconds=round(state.verify_seconds[key], 1))
         if code != 0:
             return (f"ACCEPTANCE CHECK FAILED\nCommand: {cmd}\nExit Code: {code}\n"
-                    f"Output:\n{truncate_output(out)}")
+                    f"Output:\n{truncate_output(compress_output(out))}")
         if HIDDEN_ERROR_RE.search(out):
             return (f"ACCEPTANCE CHECK FAILED (hidden error)\nCommand: {cmd}\nIt exited 0 but its output contains an error "
                     f"message: {HIDDEN_ERROR_ADVICE}.\nOutput:\n{truncate_output(out)}")
@@ -1411,7 +1847,7 @@ def run_acceptance_checks(state: TaskState) -> Optional[str]:
 def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
     """Run one task. Returns (success, reason, transcript)."""
     task_name = os.path.basename(task_path)
-    transcript: list[str] = []
+    transcript: list[str] = LiveTranscript(os.path.join(CFG.logs_dir, f"live_{os.path.splitext(task_name)[0]}.txt"))
 
     with open(task_path, "r", encoding="utf-8") as f:
         raw = f.read().strip()
@@ -1428,6 +1864,14 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
         state.events.emit("task_start_refused", missing=missing)
         return False, reason, transcript
     state.verify_cmds = verify_cmds
+    state.quick_cmds = parse_quick_checks(raw)
+    load_verify_cache(state)
+    unreadable = snapshot_protected(state, parse_protected_files(raw))
+    if unreadable:
+        reason = f"Protected file(s) missing from {state.container_dir}: {', '.join(unreadable)}."
+        print(f"[!] {reason}")
+        state.events.emit("task_start_refused", missing=unreadable)
+        return False, reason, transcript
     state.preexisting_files = container_dir_has_files(state.container_dir)
     state.base_prompt = build_task_prompt(state, goal)
     git_init(state, attempt)
@@ -1440,9 +1884,17 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
         {"role": "system", "content": build_system_prompt(state)},
         {"role": "user", "content": render_task_message(state)},
     ]
+    if CFG.initial_status and state.preexisting_files and state.verify_cmds:
+        # Start from the facts: run the checks once before the first turn and pin what fails.
+        print("[*] Running the acceptance checks once before the first turn (existing project)...")
+        state.transcript = transcript
+        periodic_status(state, 0)      # cannot complete here: no tool call has been made yet
+        state.status_version = workdir_fingerprint(state)
 
     try:
         success, reason = _agent_loop(state, history, transcript)
+        if not success:
+            restore_best(state)
     finally:
         finalize_git(state)
         fix_ownership(state)
@@ -1540,6 +1992,8 @@ def render_kept_notes(state: TaskState) -> str:
         parts.append("LEARNED so far (kept even when old turns are trimmed):\n" + "\n".join(f"- {x}" for x in state.learned[-25:]))
     if state.plan:
         parts.append(f"YOUR LATEST PLAN: {state.plan}")
+    if state.advice and state.iteration <= state.advice_until:
+        parts.append(state.advice)
     return "\n".join(parts)
 
 
@@ -1556,7 +2010,7 @@ def consolidate_notes(state: TaskState, history: list[dict], iteration: int) -> 
                                               "State ONLY facts that appear in the text you are given and NEVER guess causes. If an AUTHORITATIVE STATUS shows an "
                                               "error message, your first LEARNED line must quote it exactly with its file and line. Output ONLY: up to 4 lines "
                                               "starting with `LEARNED:` (one concrete fact each) and exactly one line starting with `PLAN:` (the next 2-3 "
-                                              "concrete steps; if there is a crash, the first step is to run the game and fix that error). No other text, "
+                                              "concrete steps; if there is a crash, the first step is to fix that error). No other text, "
                                               "no tool calls."},
                 {"role": "user", "content": prompt}]
     state.last_notes_turn = iteration
@@ -1596,6 +2050,144 @@ def source_snippets(state: TaskState, failure: str, limit: int = 2) -> str:
     return "\n".join(blocks)
 
 
+def pick_focus(pairs: list) -> tuple:
+    """The check to work on next: a crash first (nothing else can pass), then 'add X' failures (something simply
+    missing: quick wins that build momentum), then the rest in the checker's order."""
+    def rank(p):
+        n, r = p
+        if "runs without crashing" in n or re.search(r"\b\w*Error\b|Traceback", r):
+            return 0
+        if re.match(r"\s*(add|missing)\b", r, re.IGNORECASE):
+            return 1
+        return 2
+    return min(pairs, key=rank)
+
+
+def consult(state: TaskState, iteration: int, focus: tuple) -> None:
+    """The main model has failed the same check for a long time. Ask a different (dense) model once for a diagnosis, with
+    the failing check and the files that were edited recently, and pin its answer as advice for a few turns."""
+    name, reason = focus
+    files = []
+    budget = 30000
+    candidates = list(reversed(state.recent_edits)) + [r for r in reversed(list(state.reads)) if r not in state.recent_edits]
+    if not candidates:
+        code, out = cexec(["bash", "-c", "git ls-files '*.py' 2>/dev/null | head -n 30"], workdir=state.container_dir)
+        candidates = [l.strip() for l in out.splitlines() if l.strip() and not l.strip().startswith(("test_", "check_"))]
+    for rel in candidates[:6]:
+        text, _ = container_read(posixpath.join(state.container_dir, rel))
+        if text is None or rel in state.protected:
+            continue
+        numbered = "\n".join(f"{i:>4} | {l}" for i, l in enumerate(text.splitlines(), 1))
+        if len(numbered) > budget:
+            continue
+        budget -= len(numbered)
+        files.append(f"=== {rel} ===\n{numbered}")
+    if not files:
+        print(f"[consult] skipped: no readable source files (edited={state.recent_edits}, read={list(state.reads)[:6]})")
+        state.events.emit("consult_skipped", reason="no files", edits=state.recent_edits, reads=list(state.reads)[:6])
+        return False
+    prompt = (f"A coding agent keeps failing this acceptance check:\n  {name} -> {reason[:1500]}\n\nTask (start): "
+              f"{state.base_prompt[:1200]}\n\nThe files it has been editing:\n" + "\n\n".join(files) +
+              "\n\nFind the most likely cause of THIS failure in the code above. Consider that the failure message may be "
+              "computed from values the program reports (for example a counter in a state dump) rather than from the behavior "
+              "itself. Answer in at most 6 lines: the file and line, "
+              "what is wrong, and the exact change to make. No other text.")
+    print(f"[consult] asking {CFG.consult_model} about: {name}")
+    t0 = time.monotonic()
+    try:
+        res = heavy_client.chat(model=CFG.consult_model, messages=[{"role": "user", "content": prompt}],
+                                options={"num_ctx": 32768, "num_predict": 10000, "temperature": 0.3},
+                                keep_alive="5m", think=True)
+        msg = _field(res, "message", {})
+        answer = strip_thinking(_field(msg, "content", "") or "").strip()
+        thinking = str(_field(msg, "thinking", "") or "")
+        if not answer and thinking:
+            # the reasoning used the whole budget: ask for the conclusion, thinking off
+            res = heavy_client.chat(model=CFG.consult_model, messages=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "My analysis so far:\n" + thinking[-6000:]},
+                {"role": "user", "content": "Now give your answer: at most 6 lines with the file, line, what is wrong and the exact change."}],
+                options={"num_ctx": 32768, "num_predict": 800, "temperature": 0.3}, keep_alive="5m", think=False)
+            answer = strip_thinking(_field(_field(res, "message", {}), "content", "") or "").strip()
+    except Exception as e:
+        print(f"[consult] failed: {e}")
+        state.events.emit("consult_failed", error=str(e)[:200])
+        return False
+    if not answer:
+        state.events.emit("consult_skipped", reason="empty answer")
+        return False
+    state.advice = (f"ADVICE from a second reviewer about `{name}` (it read your recent files; verify it against the code before "
+                    f"acting on it):\n{answer[:1200]}")
+    state.advice_until = iteration + CFG.consult_turns
+    state.events.emit("consult", turn=iteration, check=name, seconds=round(time.monotonic() - t0, 1), answer=answer[:300])
+    log_to_transcript(state, f"=== Consult at turn {iteration} ({CFG.consult_model}) ===\n{answer}")
+    return True
+
+
+def track_best(state: TaskState, iteration: int, failing: int) -> str:
+    """Remember the git commit with the fewest failing checks. Warn when the work has become clearly worse than that."""
+    if not state.git_enabled:
+        return ""
+    git_checkpoint(state, f"status turn {iteration}")
+    code, head = cgit(state, "rev-parse", "--short", "HEAD")
+    head = head.strip() if code == 0 else ""
+    if head and (not state.best or failing < state.best[0]):
+        state.best = (failing, head, iteration)
+        return ""
+    if state.best and failing >= state.best[0] + CFG.regression_margin:
+        n, commit, turn = state.best
+        state.events.emit("regression_warning", turn=iteration, failing=failing, best=n, best_turn=turn)
+        return (f"REGRESSION: only {n} checks failed at turn {turn} (commit {commit}); now {failing} fail. Your recent changes broke "
+                f"things. See them with `git diff {commit} -- . ':!*.png' | head -150` and undo a bad file with "
+                f"`git checkout {commit} -- <file>`. Prefer small changes that you test one by one.")
+    return ""
+
+
+def restore_best(state: TaskState) -> None:
+    """The task failed and ended worse than its best checkpoint: put the best files back, so the next run starts there."""
+    if not (state.git_enabled and state.best and state.status_pairs):
+        return
+    n, commit, turn = state.best
+    if len(state.status_pairs) <= n:
+        return
+    git_checkpoint(state, "final (before restoring the best state)")
+    code, out = cgit(state, "checkout", commit, "--", ".")
+    if code == 0:
+        git_checkpoint(state, f"restored best state from turn {turn} ({n} failing)")
+        state.events.emit("restored_best", commit=commit, best=n, final=len(state.status_pairs))
+        print(f"[*] The task ended with {len(state.status_pairs)} failing checks; restored the best state ({n} failing, turn {turn}).")
+
+
+def build_status_block(state: TaskState) -> str:
+    pairs = state.status_pairs
+    reasons = [f"{n} -> {r[:300 if k < 3 else 140]}" for k, (n, r) in enumerate(pairs[:8])]
+    more = f"\n- ... and {len(pairs) - 8} more failing check(s)" if len(pairs) > 8 else ""
+    fixed = (f"\nNow PASSING in a later quick check (fixed since): " + "; ".join(state.status_fixed[:6])) if state.status_fixed else ""
+    focus = ""
+    if pairs:
+        n0, r0 = pick_focus(pairs)
+        focus = (f"\nFOCUS NOW: fix exactly this one check in your next reply, then rerun the checks: `{n0}` -> {r0[:400]}\n"
+                 "Find the code responsible (you have read it), change it with replace_in_file, and run the check in the same reply.")
+    return (f"AUTHORITATIVE STATUS (acceptance checks run by the harness at turn {state.status_turn}; this is newer and more reliable "
+            "than anything you remember or wrote in older notes):\n" + "\n".join(f"- {r}" for r in reasons) + more + fixed
+            + ("\n" + "\n".join(state.status_extra) if state.status_extra else "") + focus)
+
+
+def prune_status(state: TaskState, output: str) -> None:
+    """A quick check printed PASS for checks the pinned status still lists as failing: drop them and move FOCUS on."""
+    if not state.status_pairs:
+        return
+    passed = {m.strip() for m in re.findall(r"^PASS\s+(.+?)\s*$", output, re.MULTILINE)}
+    keep = [(n, r) for n, r in state.status_pairs if n not in passed]
+    gone = [n for n, _ in state.status_pairs if n in passed]
+    if gone:
+        state.status_pairs = keep
+        state.status_fixed += gone
+        state.status_block = build_status_block(state) if keep else (
+            "AUTHORITATIVE STATUS: every check that failed at the last full run now passes in the quick checks. Run the full "
+            "acceptance checks to confirm: " + ", ".join(state.verify_cmds))
+
+
 def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
     """Run the acceptance checks ourselves, whatever the model printed or piped through tail/grep, and tell it the exact result.
     Returns a success reason if everything passes and nothing blocks completion."""
@@ -1621,8 +2213,8 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
     if snippets:
         extra.append(snippets)
     if crash:
-        extra.append("A crash comes first: nothing else can pass until the game starts. Reproduce it yourself with "
-                     "`python3 tamagotchi/main.py --frames 5 2>&1 | tail -20`, open the file and line named in the error, and fix THAT.")
+        extra.append("A crash comes first: nothing else can pass until the program starts. Fix the error at the file and line "
+                     "named above FIRST (the SOURCE lines show the code), then rerun the check.")
     names = frozenset(n for n, _ in pairs)
     state.status_history.append(names)
     last3 = state.status_history[-3:]
@@ -1630,8 +2222,16 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
     if len(last3) == 3 and names and last3[0] == last3[1] == last3[2]:
         stuck = (f"The same {len(names)} check(s) have failed at the last 3 status checks (about {3 * CFG.status_every} turns). Your current approach "
                  "is not working. Stop reading and theorizing: run the failing thing, read its first error line, and change code.")
-    state.status_block = (f"AUTHORITATIVE STATUS (acceptance checks run by the harness at turn {iteration}; this is newer and more reliable than "
-                          f"anything you remember or wrote in older notes):\n{body}" + ("\n" + "\n".join(extra) if extra else "") + (f"\n{stuck}" if stuck else ""))
+    state.status_pairs, state.status_turn = pairs, iteration
+    regression = track_best(state, iteration, len(pairs)) if pairs else ""   # unparsable output (a crash) is never "best"
+    if regression:
+        extra.append(regression)
+    if pairs and (not state.focus_since or len(pairs) < state.focus_since[0]):
+        state.focus_since = (len(pairs), iteration)      # best (lowest) number of failing checks so far, and when
+    state.status_extra = extra + ([stuck] if stuck else [])
+    state.status_fixed = []
+    state.status_block = build_status_block(state) if pairs else (
+        f"AUTHORITATIVE STATUS (acceptance checks run by the harness at turn {iteration}):\n{body}")
     state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + (plateau or "")
     log_to_transcript(state, f"=== Status check at turn {iteration} ===\n{state.status_block}")
     state.events.emit("status_check", turn=iteration, failing=len(reasons))
@@ -1669,6 +2269,21 @@ def maybe_extend_budget(state: TaskState, iteration: int, limit: int,
     return new_limit, ""
 
 
+def checks_cheap_or_cached(state: TaskState) -> bool:
+    """True if running all acceptance checks now costs little: each one is either cached for the current files or was
+    measured as quick. A trivial green command must not launch a 7-minute checker on every turn."""
+    fp = None
+    for v in state.verify_cmds:
+        key = fix_command_paths(v).strip()
+        if state.verify_seconds.get(key, 30) <= max(CFG.auto_verify_seconds, 30):
+            continue
+        cached = state.verify_cache.get(key)
+        fp = fp or workdir_fingerprint(state)
+        if not (cached and cached[0] == fp):
+            return False
+    return True
+
+
 def try_auto_complete(state: TaskState, why: str) -> Optional[str]:
     """The harness's own verdict: if the task has acceptance checks, nothing blocks completion and ALL of them pass,
     the task is done, whether or not the model remembered to say so. Returns a success reason, else None."""
@@ -1695,6 +2310,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
     iteration = 0
     while True:
         iteration += 1
+        state.iteration = iteration
         if iteration > limit:
             done = try_auto_complete(state, "the turn budget was reached")
             if done:
@@ -1721,8 +2337,15 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
                 transcript.append(f"=== Auto-complete ===\n{done}")
                 return True, done
 
+        if (CFG.consult_model and state.focus_since and state.status_pairs
+                and iteration - state.focus_since[1] >= CFG.consult_after and len(state.consulted) < CFG.max_consults):
+            state.focus_since = (state.focus_since[0], iteration)
+            state.events.emit("consult_trigger", turn=iteration)
+            if consult(state, iteration, pick_focus(state.status_pairs)):
+                state.consulted.add(iteration)
         dropped = trim_history(history)
         if dropped:
+            state.reads.clear()          # the trimmed turns held those file contents: re-reading is legitimate again
             state.notes = summarize_dropped(dropped, state.notes, state)
             history[1]["content"] = render_task_message(state)
             state.events.emit("history_trimmed", dropped=len(dropped), notes_chars=len(state.notes))
@@ -1751,6 +2374,10 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         record_turn_stats(state, reply, think_chars, model_seconds, think)
 
         print(f"\n[Model Response]:\n{response}")
+        if reply.thinking:
+            th = reply.thinking
+            th = th if len(th) <= 2500 else th[:1200] + "\n[...]\n" + th[-1200:]
+            transcript.append(f"=== Turn {iteration}: model thinking ({len(reply.thinking)} chars) ===\n{th}")
         transcript.append(f"=== Turn {iteration}: model ===\n{response}")
 
         # Only the cleaned text is parsed and stored: tool tags inside <think> must never
@@ -1804,7 +2431,22 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
                 state.events.emit("thinking_budget_exhausted", think_chars=think_chars)
             if state.no_tool_streak >= CFG.max_no_tool_streak:
                 return False, f"Model replied {state.no_tool_streak} times in a row without using any tools."
-            if hit_limit or unclosed or not clean:
+            if hit_limit and not clean and reply.thinking:
+                # Salvage the reasoning instead of throwing ~3 minutes of it away: show its conclusion and ask for the action.
+                state.force_think_off = 1
+                state.hard_lock = True
+                tail = reply.thinking[-CFG.salvage_thinking_chars:]
+                msg = ("ERROR: your reasoning used the whole output budget, so no tool call was made. Here is the END of that "
+                       "reasoning (it is yours; do not redo it):\n<<<\n" + tail + "\n>>>\nThinking is OFF for this reply and reading is DISABLED for it (read_file/list_dir will be refused). Act on "
+                       "that reasoning NOW: write the concrete edit (replace_in_file / write_file) for the most promising idea, and "
+                       "run the check in the same reply. A partial fix that you test beats more analysis.")
+            elif (m := re.search(r"<write_file\s+path=[\"']([^\"']+)[\"']\s*>(.*)\Z", clean, re.DOTALL)) and "</write_file>" not in m.group(2):
+                n = m.group(2).count("\n")
+                msg = (f"ERROR: your write_file of {m.group(1)} was cut off by the output limit after about {n} lines, so NOTHING was "
+                       "written (the file is unchanged). Never rewrite a large file in one reply. Instead: change it with several "
+                       "small replace_in_file edits, or move one part of it (for example the input handling or the drawing code) "
+                       "into a NEW module of under 250 lines with write_file and import it, then remove that part with replace_in_file.")
+            elif hit_limit or unclosed or not clean:
                 msg = ("ERROR: Your reply was cut off by the output limit before any complete tool call. "
                        "Think less and write smaller files (split large ones), then call your tools.")
             else:
@@ -1850,25 +2492,46 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs))
             return False, f"Stuck: the same action produced the same result {worst} times."
 
-        if CFG.status_every and state.verify_cmds and iteration - state.last_status_turn >= CFG.status_every and not wants_complete:
+        ran_check = any(k == "run_command" and fix_command_paths(a["cmd"]).strip() in [fix_command_paths(v).strip() for v in state.verify_cmds]
+                        for k, a in calls)
+        if ran_check and not wants_complete and state.verify_cmds and checks_cheap_or_cached(state):
+            # the model just ran a check unfiltered: refresh the pinned status from it (cached, so nearly free)
+            state.status_version = workdir_fingerprint(state)
             done = periodic_status(state, iteration)
             if done:
                 transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
                 return True, done
-        if all(kind in ("read_file", "list_dir", "view_image") for kind, _ in calls):
-            state.readonly_streak += 1
-        else:
+        elif (CFG.status_every and state.verify_cmds and iteration - state.last_status_turn >= CFG.status_every and not wants_complete
+                and workdir_fingerprint(state) != state.status_version):
+            state.status_version = workdir_fingerprint(state)
+            done = periodic_status(state, iteration)
+            if done:
+                transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
+                return True, done
+        state.hard_lock = False
+        if any(kind in ("write_file", "replace_in_file") for kind, _ in calls):
             state.readonly_streak = 0
-        if state.readonly_streak >= CFG.readonly_nudge and iteration - state.last_readonly_nudge >= CFG.readonly_nudge:
+            state.read_locked = False
+        elif all(kind in ("read_file", "list_dir", "view_image", "search_web") for kind, _ in calls):
+            state.readonly_streak += 1
+        elif not state.read_locked:
+            state.readonly_streak = max(0, state.readonly_streak - 2)   # running something helps, but only an edit unlocks
+        if state.readonly_streak >= CFG.readonly_nudge and not state.read_locked:
+            state.read_locked = True
             state.last_readonly_nudge = iteration
             state.events.emit("readonly_nudge", turn=iteration, streak=state.readonly_streak)
-            text = (f"NUDGE: you have only READ files for {state.readonly_streak} turns in a row (no command run, no edit). Reading more will not find the "
-                    "bug. RUN something now: the game (`python3 tamagotchi/main.py --frames 5 2>&1 | tail -20`) or the checker, read the FIRST error "
-                    "line, open exactly the file and line it names, and fix it.")
-            log_to_transcript(state, f"=== Read-only nudge at turn {iteration} ===\n{text}")
+            first = state.verify_cmds[0] if state.verify_cmds else "your program or its tests"
+            text = (f"NUDGE: you have read for {state.readonly_streak} turns without changing any file. re-reading files and list_dir are now "
+                    "LOCKED until you edit a file. Make the change you already know is needed for the FIRST failing check "
+                    f"(`{first}` shows them), using replace_in_file, and rerun the check in the same reply.")
+            log_to_transcript(state, f"=== Read-only lock at turn {iteration} ===\n{text}")
             state.pending_note = (state.pending_note + "\n\n" if state.pending_note else "") + text
         notes = list(nudges)
-        auto_note = maybe_auto_attach_image(state, iteration, outputs)
+        restored = restore_protected(state)
+        if restored:
+            notes.append(f"WARNING: you changed protected file(s) {', '.join(restored)}; the harness restored the originals. "
+                         "Never modify them: change your own code so it passes.")
+        auto_note = maybe_auto_attach_image(state, iteration, [o for (k, _), o in zip(calls, outputs) if k == "run_command"])
         if auto_note:
             notes.append(auto_note)
         plateau_note = update_plateau(state, iteration, outputs)
@@ -1886,11 +2549,43 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
             notes.append("NOTE: Your <status>COMPLETE</status> was ignored because you had not yet seen these results. "
                          "Re-issue it once everything is verified.")
 
+        edited = any(k in ("write_file", "replace_in_file") and o.split("Output:\n", 1)[-1].startswith("Successfully")
+                     for (k, _), o in zip(calls, outputs))
+        ran = any(k == "run_command" for k, _ in calls)
+        state.blind_edits = state.blind_edits + 1 if (edited and not ran) else (0 if ran else state.blind_edits)
+        if edited and not ran and state.quick_cmds and not wants_complete:
+            for qc in state.quick_cmds:
+                code, out = container_exec(state, fix_command_paths(qc), timeout=180)
+                state.events.emit("quick_check", turn=iteration, cmd=qc, exit_code=code)
+                prune_status(state, out)
+                notes.append(f"QUICK CHECK run by the harness after your edit: {qc}\nExit Code: {code}\n"
+                             + truncate_output(compress_output(out), 4000))
+                if code != 0:
+                    break
+            state.blind_edits = 0          # the quick checks were the feedback
+        cheap = sum(state.verify_seconds.get(fix_command_paths(v).strip(), 5) for v in state.verify_cmds) <= CFG.auto_verify_seconds
+        if (CFG.auto_verify_seconds and edited and not ran and state.verify_cmds and not wants_complete
+                and (cheap or state.blind_edits >= CFG.blind_edit_limit)):
+            state.blind_edits = 0
+            failure = run_acceptance_checks(state)
+            state.events.emit("auto_verify", turn=iteration, passed=failure is None)
+            if failure is None:
+                state.last_exit_code, state.hidden_error, state.unverified_changes = 0, False, False
+                done = try_auto_complete(state, "the harness re-ran the checks after your edit")
+                if done:
+                    transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
+                    return True, done
+            else:
+                notes.append("AUTO-CHECK: you edited files without running anything, so the harness ran the acceptance checks for you:\n"
+                             + failure[:3500])
+                state.status_version = workdir_fingerprint(state)
+                periodic_status(state, iteration)        # cached: just refreshes the pinned status and FOCUS
+
         committed = git_checkpoint(state, f"turn {iteration}")
         if committed:
             state.events.emit("checkpoint", turn=iteration)
 
-        if green and not wants_complete:
+        if green and not wants_complete and checks_cheap_or_cached(state):
             done = try_auto_complete(state, "after you ran an acceptance command successfully")
             if done:
                 transcript.append(f"=== Turn {iteration}: tool results ===\n" + "\n\n".join(outputs) + f"\n=== Auto-complete ===\n{done}")
@@ -1901,9 +2596,9 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
         history.append({
             "role": "user",
             "content": (f"Tool Execution Results:\n{combined}\n\n"
-                        "Review the outputs above. If any tool failed or produced empty files, fix it immediately. "
-                        "Otherwise continue, or write <status>COMPLETE</status> once the final state is verified. "
-                        "Reply with tool tags only, no explanations."
+                        "Review the outputs above. If something failed, fix its cause now (edit the code, then rerun the check in the same "
+                        "reply). Otherwise continue, or write <status>COMPLETE</status> once the final state is verified. "
+                        "Start with the LEARNED:/PLAN: lines, then the tool tags."
                         + (" End your reply with <turns_left>N</turns_left>." if CFG.ask_turns_left else "")),
         })
 

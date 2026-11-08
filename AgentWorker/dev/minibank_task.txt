@@ -1,0 +1,9 @@
+WORKDIR: minibank
+REQUIRE: SPEC.md
+PROTECT: check_bank.py
+
+Bring the minibank package up to SPEC.md. The code in minibank/ is an early draft with several bugs and missing
+features (ledger.py, cli.py, and a missing report.py). Read SPEC.md and the code, then fix and extend the code until
+`python3 check_bank.py` prints ALL CHECKS PASSED. Each FAIL line gives its reason after "->".
+
+VERIFY: python3 check_bank.py
