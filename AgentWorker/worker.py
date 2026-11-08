@@ -100,7 +100,7 @@ class Config:
     model_retries: int = 2
     command_timeout: int = 600            # per command, enforced inside the container
     max_output_chars: int = 8000          # command output shown to the model (head + tail)
-    think_char_limit: int = 24000         # reasoning longer than this (without an answer) is cut off and salvaged (0 = off)
+    think_char_limit: int = 14000         # reasoning longer than this (without an answer) is cut off and salvaged (0 = off)
     max_read_chars: int = 24000           # read_file output shown to the model (about 250 lines at once)
     max_history_chars: int = 0            # 0 = derive from num_ctx and num_predict
     max_notes_chars: int = 2500           # pinned summary of trimmed turns
