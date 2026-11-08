@@ -2098,7 +2098,17 @@ def consult(state: TaskState, iteration: int, focus: tuple) -> None:
         res = heavy_client.chat(model=CFG.consult_model, messages=[{"role": "user", "content": prompt}],
                                 options={"num_ctx": 32768, "num_predict": 10000, "temperature": 0.3},
                                 keep_alive="5m", think=True)
-        answer = strip_thinking(_field(_field(res, "message", {}), "content", "") or "").strip()
+        msg = _field(res, "message", {})
+        answer = strip_thinking(_field(msg, "content", "") or "").strip()
+        thinking = str(_field(msg, "thinking", "") or "")
+        if not answer and thinking:
+            # the reasoning used the whole budget: ask for the conclusion, thinking off
+            res = heavy_client.chat(model=CFG.consult_model, messages=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "My analysis so far:\n" + thinking[-6000:]},
+                {"role": "user", "content": "Now give your answer: at most 6 lines with the file, line, what is wrong and the exact change."}],
+                options={"num_ctx": 32768, "num_predict": 800, "temperature": 0.3}, keep_alive="5m", think=False)
+            answer = strip_thinking(_field(_field(res, "message", {}), "content", "") or "").strip()
     except Exception as e:
         print(f"[consult] failed: {e}")
         state.events.emit("consult_failed", error=str(e)[:200])
