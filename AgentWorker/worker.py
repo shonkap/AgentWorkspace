@@ -87,6 +87,7 @@ class Config:
     salvage_thinking_chars: int = 3000    # when thinking eats the whole reply budget, show the model this much of its tail
     consult_model: str = "qwen3.6-27b-uncensored:latest"   # second opinion when stuck on one check ("" = off)
     consult_after: int = 20               # no fewer failing checks for this many turns triggers a consult
+    regression_margin: int = 3            # this many more failing checks than the best checkpoint triggers a warning
     max_consults: int = 3                 # per task (each one swaps models on the GPU: several minutes)
     consult_turns: int = 10               # the advice stays pinned for this many turns
     blind_edit_limit: int = 3             # after this many edit-only turns in a row, the harness runs the checks even if slow
@@ -249,6 +250,7 @@ class TaskState:
     protected_lines_read: dict = field(default_factory=dict)
     reshown: set = field(default_factory=set)            # small unchanged ranges already shown a second time   # rel -> lines of a protected file shown so far
     recent_edits: list = field(default_factory=list)     # rel paths edited, newest last
+    best: tuple = ()                                     # (fewest failing checks, git commit, turn)
     focus_since: tuple = ()                              # (fewest failing checks seen, turn it was reached)
     consulted: set = field(default_factory=set)          # FOCUS checks a consult was already asked about
     advice: str = ""
@@ -1891,6 +1893,8 @@ def run_task(task_path: str, attempt: int) -> tuple[bool, str, list[str]]:
 
     try:
         success, reason = _agent_loop(state, history, transcript)
+        if not success:
+            restore_best(state)
     finally:
         finalize_git(state)
         fix_ownership(state)
@@ -2110,6 +2114,40 @@ def consult(state: TaskState, iteration: int, focus: tuple) -> None:
     return True
 
 
+def track_best(state: TaskState, iteration: int, failing: int) -> str:
+    """Remember the git commit with the fewest failing checks. Warn when the work has become clearly worse than that."""
+    if not state.git_enabled:
+        return ""
+    git_checkpoint(state, f"status turn {iteration}")
+    code, head = cgit(state, "rev-parse", "--short", "HEAD")
+    head = head.strip() if code == 0 else ""
+    if head and (not state.best or failing < state.best[0]):
+        state.best = (failing, head, iteration)
+        return ""
+    if state.best and failing >= state.best[0] + CFG.regression_margin:
+        n, commit, turn = state.best
+        state.events.emit("regression_warning", turn=iteration, failing=failing, best=n, best_turn=turn)
+        return (f"REGRESSION: only {n} checks failed at turn {turn} (commit {commit}); now {failing} fail. Your recent changes broke "
+                f"things. See them with `git diff {commit} -- . ':!*.png' | head -150` and undo a bad file with "
+                f"`git checkout {commit} -- <file>`. Prefer small changes that you test one by one.")
+    return ""
+
+
+def restore_best(state: TaskState) -> None:
+    """The task failed and ended worse than its best checkpoint: put the best files back, so the next run starts there."""
+    if not (state.git_enabled and state.best and state.status_pairs):
+        return
+    n, commit, turn = state.best
+    if len(state.status_pairs) <= n:
+        return
+    git_checkpoint(state, "final (before restoring the best state)")
+    code, out = cgit(state, "checkout", commit, "--", ".")
+    if code == 0:
+        git_checkpoint(state, f"restored best state from turn {turn} ({n} failing)")
+        state.events.emit("restored_best", commit=commit, best=n, final=len(state.status_pairs))
+        print(f"[*] The task ended with {len(state.status_pairs)} failing checks; restored the best state ({n} failing, turn {turn}).")
+
+
 def build_status_block(state: TaskState) -> str:
     pairs = state.status_pairs
     reasons = [f"{n} -> {r[:300 if k < 3 else 140]}" for k, (n, r) in enumerate(pairs[:8])]
@@ -2175,6 +2213,9 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
         stuck = (f"The same {len(names)} check(s) have failed at the last 3 status checks (about {3 * CFG.status_every} turns). Your current approach "
                  "is not working. Stop reading and theorizing: run the failing thing, read its first error line, and change code.")
     state.status_pairs, state.status_turn = pairs, iteration
+    regression = track_best(state, iteration, len(pairs))
+    if regression:
+        extra.append(regression)
     if pairs and (not state.focus_since or len(pairs) < state.focus_since[0]):
         state.focus_since = (len(pairs), iteration)      # best (lowest) number of failing checks so far, and when
     state.status_extra = extra + ([stuck] if stuck else [])
