@@ -2218,7 +2218,7 @@ def checks_cheap_or_cached(state: TaskState) -> bool:
     fp = None
     for v in state.verify_cmds:
         key = fix_command_paths(v).strip()
-        if state.verify_seconds.get(key, 9999) <= max(CFG.auto_verify_seconds, 30):
+        if state.verify_seconds.get(key, 30) <= max(CFG.auto_verify_seconds, 30):
             continue
         cached = state.verify_cache.get(key)
         fp = fp or workdir_fingerprint(state)
@@ -2506,7 +2506,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
                 if code != 0:
                     break
             state.blind_edits = 0          # the quick checks were the feedback
-        cheap = sum(state.verify_seconds.get(fix_command_paths(v).strip(), 9999) for v in state.verify_cmds) <= CFG.auto_verify_seconds
+        cheap = sum(state.verify_seconds.get(fix_command_paths(v).strip(), 30) for v in state.verify_cmds) <= CFG.auto_verify_seconds
         if (CFG.auto_verify_seconds and edited and not ran and state.verify_cmds and not wants_complete
                 and (cheap or state.blind_edits >= CFG.blind_edit_limit)):
             state.blind_edits = 0
