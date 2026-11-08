@@ -3,8 +3,10 @@
 
 For each menu opened with --open KIND, --dump-state must contain "menu_layout" in WINDOW pixels (960x540):
     {"panel": [x, y, w, h], "title": [x, y, w, h], "lines": [[x, y, w, h], ...], "items": [[x, y, w, h], ...],
-     "hint": [x, y, w, h]}
-with the rectangle of every piece of text as actually drawn (font.size() of the rendered string). The check also
+     "hint": [x, y, w, h], "other": [[x, y, w, h], ...]}
+with the rectangle of every piece of text as actually drawn (font.size() of the rendered string); "other" holds any
+other text inside the panel (for example a clock). The check verifies the rectangles against the pixels: every white
+text pixel inside the panel must lie inside one of the reported text rectangles. The check also
 compares the screenshot with and without the menu: nothing may be drawn outside the reported panel.
     python3 ui_check.py
 """
@@ -63,7 +65,8 @@ for kind, extra in CASES.items():
         continue
     panel = lay.get("panel")
     texts = [("title", lay.get("title"))] + [(f"line {i + 1}", r) for i, r in enumerate(lay.get("lines") or [])] \
-        + [(f"item {i + 1}", r) for i, r in enumerate(lay.get("items") or [])] + [("hint", lay.get("hint"))]
+        + [(f"item {i + 1}", r) for i, r in enumerate(lay.get("items") or [])] + [("hint", lay.get("hint"))] \
+        + [(f"other {i + 1}", r) for i, r in enumerate(lay.get("other") or [])]
     bad = [n for n, r in [("panel", panel)] + texts if not valid(r)]
     if bad:
         check(f"{kind}: menu_layout rectangles are [x, y, w, h] with w, h > 0", False, f"malformed: {bad}")
@@ -82,6 +85,12 @@ for kind, extra in CASES.items():
     diff = ImageChops.difference(img, base_img).getbbox()
     check(f"{kind}: nothing is drawn outside the reported panel", diff is None or inside(list(diff[:2]) + [diff[2] - diff[0], diff[3] - diff[1]], panel, 2),
           f"the menu changed pixels in box {diff}, but the panel is {panel}")
+    rects = [r for _, r in texts]
+    stray = [(x, y) for y in range(int(panel[1]), int(panel[1] + panel[3]), 2) for x in range(int(panel[0]), int(panel[0] + panel[2]), 2)
+             if min(img.getpixel((x, y))) >= 236 and not any(inside([x, y, 1, 1], r, 2) for r in rects)]
+    check(f"{kind}: the reported text rectangles cover all text drawn in the panel", len(stray) <= 3,
+          f"{len(stray)} white text pixels lie outside every reported rectangle, e.g. {stray[:4]} (window pixels). The reported "
+          "rects must be the real size of the drawn text (font.size(string)); if two labels are too close, space them out")
     img.save(os.path.join(HERE, f"ui_{kind}.png"))
 
 print()
