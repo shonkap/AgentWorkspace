@@ -247,7 +247,7 @@ class Tests(unittest.TestCase):
         W.heavy_client = type("H", (), {"chat": staticmethod(lambda **kw: asked.append(kw) or
                                                               {"message": {"content": "a.py line 1: write val.txt"}})})()
         W.run_task(task_file(sb, "WORKDIR: proj\nx\nVERIFY: python3 check.py"), 1)
-        self.assertEqual(len(asked), 1)
+        self.assertTrue(1 <= len(asked) <= 3, len(asked))
         self.assertIn("x = 1", asked[0]["messages"][0]["content"])
         self.assertIn("ADVICE from a second reviewer", model.seen[-1][-1]["content"])
 

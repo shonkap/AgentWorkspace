@@ -86,7 +86,8 @@ class Config:
     protected_read_lines: int = 200       # read_file shows at most this many lines of each PROTECTED file per task
     salvage_thinking_chars: int = 3000    # when thinking eats the whole reply budget, show the model this much of its tail
     consult_model: str = "qwen3.6-27b-uncensored:latest"   # second opinion when stuck on one check ("" = off)
-    consult_after: int = 20               # the same FOCUS check for this many turns triggers a consult
+    consult_after: int = 20               # no fewer failing checks for this many turns triggers a consult
+    max_consults: int = 3                 # per task (each one swaps models on the GPU: several minutes)
     consult_turns: int = 10               # the advice stays pinned for this many turns
     blind_edit_limit: int = 3             # after this many edit-only turns in a row, the harness runs the checks even if slow
     min_read_lines: int = 150             # read_file ranges smaller than this are widened (0 = off)
@@ -248,7 +249,7 @@ class TaskState:
     protected_lines_read: dict = field(default_factory=dict)
     reshown: set = field(default_factory=set)            # small unchanged ranges already shown a second time   # rel -> lines of a protected file shown so far
     recent_edits: list = field(default_factory=list)     # rel paths edited, newest last
-    focus_since: tuple = ()                              # (FOCUS check name, turn it became the focus)
+    focus_since: tuple = ()                              # (fewest failing checks seen, turn it was reached)
     consulted: set = field(default_factory=set)          # FOCUS checks a consult was already asked about
     advice: str = ""
     advice_until: int = 0
@@ -2167,10 +2168,8 @@ def periodic_status(state: TaskState, iteration: int) -> Optional[str]:
         stuck = (f"The same {len(names)} check(s) have failed at the last 3 status checks (about {3 * CFG.status_every} turns). Your current approach "
                  "is not working. Stop reading and theorizing: run the failing thing, read its first error line, and change code.")
     state.status_pairs, state.status_turn = pairs, iteration
-    if pairs:
-        fname = pick_focus(pairs)[0]
-        if not state.focus_since or state.focus_since[0] != fname:
-            state.focus_since = (fname, iteration)
+    if pairs and (not state.focus_since or len(pairs) < state.focus_since[0]):
+        state.focus_since = (len(pairs), iteration)      # best (lowest) number of failing checks so far, and when
     state.status_extra = extra + ([stuck] if stuck else [])
     state.status_fixed = []
     state.status_block = build_status_block(state) if pairs else (
@@ -2281,11 +2280,10 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
                 return True, done
 
         if (CFG.consult_model and state.focus_since and state.status_pairs
-                and iteration - state.focus_since[1] >= CFG.consult_after and state.focus_since[0] not in state.consulted):
-            focus = next((p for p in state.status_pairs if p[0] == state.focus_since[0]), None)
-            if focus:
-                state.consulted.add(focus[0])
-                consult(state, iteration, focus)
+                and iteration - state.focus_since[1] >= CFG.consult_after and len(state.consulted) < CFG.max_consults):
+            state.consulted.add(state.focus_since)         # at most one consult per plateau
+            state.focus_since = (state.focus_since[0], iteration)
+            consult(state, iteration, pick_focus(state.status_pairs))
         dropped = trim_history(history)
         if dropped:
             state.reads.clear()          # the trimmed turns held those file contents: re-reading is legitimate again
@@ -2506,7 +2504,7 @@ def _agent_loop(state: TaskState, history: list[dict], transcript: list[str]) ->
                 if code != 0:
                     break
             state.blind_edits = 0          # the quick checks were the feedback
-        cheap = sum(state.verify_seconds.get(fix_command_paths(v).strip(), 30) for v in state.verify_cmds) <= CFG.auto_verify_seconds
+        cheap = sum(state.verify_seconds.get(fix_command_paths(v).strip(), 5) for v in state.verify_cmds) <= CFG.auto_verify_seconds
         if (CFG.auto_verify_seconds and edited and not ran and state.verify_cmds and not wants_complete
                 and (cheap or state.blind_edits >= CFG.blind_edit_limit)):
             state.blind_edits = 0
