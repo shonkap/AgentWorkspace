@@ -62,7 +62,20 @@ rewrite the whole file. Splitting the work into separate, well-checked tasks hel
 2. `dev/office_refactor_task2.txt`: split main.py into input_router/render/hud/game_engine modules. The checker is
    `refactor_check.py`: no new failures, identical screenshots, sizes. It prints a pixel diff and saves `refactor_diff.png`.
    The first two runs failed (a stuck loop and an abort); **the third PASSED in 20 turns**.
-3. officeV21–V27: the stage 2 game task again, on the modular code. 16 failing checks remain (8 checks, each failing in
+3. officeV21–V27: the full stage 2 task again. It thrashed: 16 failures went up to 35, which is why the best-state guard exists.
+4. **Focused tasks** (`dev/make_focus_task.py` + `subset_check.py`): each targets a few checks, and the verify condition
+   is "those pass and nothing else breaks". Results: A (dump frame counter) 34 turns, D (interactions counter) 8 turns,
+   C (no movement while a menu is open) 5 turns, B1 (HUD layout) 18 turns, B2 (sprite) failed, B3 (camera not applied
+   when drawing, given the diagnosis) 15 turns.
+   **Result: `check_office2.py` prints ALL CHECKS PASSED**, and every stage 2 acceptance command passes.
+5. UI polish (`ui_check.py`): the checks pass, but the menus overflow and overlap when you actually look at them.
+   This task makes the game report its menu layout, which is checked for containment, overlap and a screenshot diff.
+
+Lesson: the local 35B is good at well-scoped tasks (5–35 turns) with a fast, precise checker. It fails at "fix these 8
+unrelated things in a big file". The highest-leverage work is writing the task brief and the checker, the way a lead
+would for a junior developer. Brief hints about the root cause (one or two sentences) turned failures into
+5–15-turn passes.
+, on the modular code. 16 failing checks remain (8 checks, each failing in
    script and live mode): live input routing, pause, and HUD layout.
 
 ## Runs
